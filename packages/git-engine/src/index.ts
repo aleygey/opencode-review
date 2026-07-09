@@ -1,0 +1,5 @@
+export type { RepoInfo, CheckpointRef, ChangeItem, ChangeStatus, Hunk, AgentWriteRecord } from './types.ts'
+export { discoverRepos } from './discover.ts'
+export { checkpoint, shadowRepoPath } from './checkpoint.ts'
+export { collectChanges, ensureCommitPresent } from './collect.ts'
+export { revertFile, revertHunk, revertRepo } from './revert.ts'

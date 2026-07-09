@@ -1,0 +1,15 @@
+{
+  "name": "opencode-git-engine",
+  "version": "0.1.0",
+  "description": "Multi-repo git checkpoint / diff / rollback engine for the opencode VSCode review extension. Zero runtime dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.6" },
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "node --test",
+    "demo": "node src/cli.ts demo",
+    "cli": "node src/cli.ts"
+  },
+  "files": ["src", "test", "SPEC.md", "README.md"]
+}
