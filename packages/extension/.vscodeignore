@@ -1,0 +1,7 @@
+**
+!dist/extension.js
+!dist/engineHost.js
+!media/**
+!README.md
+!LICENSE
+!package.json

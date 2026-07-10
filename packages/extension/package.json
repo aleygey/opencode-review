@@ -1,0 +1,123 @@
+{
+  "name": "oc-review",
+  "displayName": "OC Review — opencode change review",
+  "description": "Review, navigate and roll back opencode's edits across nested git repos; inline diff marks and quick-ask about any selection.",
+  "version": "0.2.0",
+  "publisher": "aleygey",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/aleygey/opencode-review" },
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "ocReview", "title": "OC Review", "icon": "media/icon.svg" }
+      ]
+    },
+    "views": {
+      "ocReview": [
+        { "id": "ocReview.changes", "name": "Changes", "icon": "media/icon.svg" }
+      ]
+    },
+    "commands": [
+      { "command": "ocReview.connect", "title": "OC Review: Connect to opencode Server" },
+      { "command": "ocReview.checkpoint", "title": "OC Review: Checkpoint Now (New Baseline)", "icon": "$(history)" },
+      { "command": "ocReview.refresh", "title": "OC Review: Refresh Changes", "icon": "$(refresh)" },
+      { "command": "ocReview.acceptAll", "title": "OC Review: Accept All (New Baseline)", "icon": "$(check-all)" },
+      { "command": "ocReview.openDiff", "title": "OC Review: Open Diff" },
+      { "command": "ocReview.revertFile", "title": "OC Review: Revert File to Baseline" },
+      { "command": "ocReview.revertHunk", "title": "OC Review: Revert This Hunk" },
+      { "command": "ocReview.revertRepo", "title": "OC Review: Revert Entire Repo to Baseline" },
+      { "command": "ocReview.markReviewed", "title": "OC Review: Toggle Reviewed" },
+      { "command": "ocReview.nextChange", "title": "OC Review: Next Change" },
+      { "command": "ocReview.prevChange", "title": "OC Review: Previous Change" },
+      { "command": "ocReview.toggleInline", "title": "OC Review: Toggle Inline Change Marks" },
+      { "command": "ocReview.quickAsk", "title": "OC Review: Ask opencode About Selection" },
+      { "command": "ocReview.diagnose", "title": "OC Review: Diagnose" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "ocReview.quickAsk", "when": "editorTextFocus", "group": "ocreview@1" }
+      ],
+      "view/title": [
+        { "command": "ocReview.checkpoint", "when": "view == ocReview.changes", "group": "navigation@1" },
+        { "command": "ocReview.refresh", "when": "view == ocReview.changes", "group": "navigation@2" },
+        { "command": "ocReview.acceptAll", "when": "view == ocReview.changes", "group": "navigation@3" }
+      ],
+      "view/item/context": [
+        { "command": "ocReview.openDiff", "when": "view == ocReview.changes && viewItem == file", "group": "inline@1" },
+        { "command": "ocReview.revertFile", "when": "view == ocReview.changes && viewItem == file", "group": "1_mod@1" },
+        { "command": "ocReview.markReviewed", "when": "view == ocReview.changes && viewItem == file", "group": "1_mod@2" },
+        { "command": "ocReview.revertHunk", "when": "view == ocReview.changes && viewItem == hunk", "group": "1_mod@1" },
+        { "command": "ocReview.revertRepo", "when": "view == ocReview.changes && viewItem == repo", "group": "1_mod@1" }
+      ]
+    },
+    "keybindings": [
+      { "command": "ocReview.nextChange", "key": "ctrl+alt+pagedown", "when": "editorTextFocus" },
+      { "command": "ocReview.prevChange", "key": "ctrl+alt+pageup", "when": "editorTextFocus" },
+      { "command": "ocReview.quickAsk", "key": "ctrl+alt+a", "when": "editorTextFocus" }
+    ],
+    "configuration": {
+      "title": "OC Review",
+      "properties": {
+        "ocReview.serverUrl": {
+          "type": "string",
+          "default": "",
+          "description": "opencode server base URL (e.g. http://127.0.0.1:4096). Empty = auto-discover (lock file, then port probe)."
+        },
+        "ocReview.serverPassword": {
+          "type": "string",
+          "default": "",
+          "description": "Password if the server was started with OPENCODE_SERVER_PASSWORD (HTTP basic, user 'opencode')."
+        },
+        "ocReview.probePorts": {
+          "type": "array",
+          "items": { "type": "number" },
+          "default": [4096],
+          "description": "Ports probed on 127.0.0.1 during auto-discovery."
+        },
+        "ocReview.askModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for quick-ask as provider/model (e.g. anthropic/claude-sonnet-4-5). Empty = let the server pick its default."
+        },
+        "ocReview.autoCheckpoint": {
+          "type": "string",
+          "enum": ["turn", "off"],
+          "default": "turn",
+          "description": "turn = automatically checkpoint all repos when an opencode turn starts (only if the previous review is clean)."
+        },
+        "ocReview.shadowDir": {
+          "type": "string",
+          "default": "",
+          "description": "Directory for the shadow baseline stores. Empty = extension global storage."
+        },
+        "ocReview.strictAttribution": {
+          "type": "boolean",
+          "default": true,
+          "description": "Treat changes with no observed agent write ('unverified') as possibly user-owned: reverting them requires an explicit confirmation. Turn off only if you never edit files yourself during a session."
+        },
+        "ocReview.inlineMarks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inline change decorations (added-line background, deletion anchors) in editors."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/pure.test.ts",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.1.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}
