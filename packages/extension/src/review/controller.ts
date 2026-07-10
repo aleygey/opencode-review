@@ -27,8 +27,10 @@ export type ReviewState = {
 
 const KEY_BASELINE = 'ocReview.baseline.v1'
 const KEY_BASELINE_PREV = 'ocReview.baseline.prev.v1' // one-step recovery from an accidental re-baseline
+const KEY_HISTORY = 'ocReview.baseline.history.v1'
+const HISTORY_CAP = 30
 
-type StoredBaseline = { id: string; at: number; refs: CheckpointRef[] }
+export type StoredBaseline = { id: string; at: number; refs: CheckpointRef[] }
 
 export class ReviewController {
   private repos: RepoInfo[] = []
@@ -118,9 +120,13 @@ export class ReviewController {
     const id = `vs-${Date.now()}`
     this.log.info(`checkpoint (${reason}) id=${id} repos=${this.repos.length}`)
     const refs = await this.engine.checkpoint(this.repos, this.shadowDir, id)
-    // Keep the previous baseline recoverable (one step) before overwriting.
+    // Retire the current baseline into HISTORY — the shadow refs are permanent, so any
+    // historical baseline can later be re-viewed or reverted to (batch rollback).
     const prev = this.memento.get<StoredBaseline>(KEY_BASELINE)
-    if (prev) await this.memento.update(KEY_BASELINE_PREV, prev)
+    if (prev) {
+      await this.memento.update(KEY_BASELINE_PREV, prev)
+      await this.pushHistory(prev)
+    }
     this.refs = refs
     this.baselineId = id
     this.baselineAt = Date.now()
@@ -310,6 +316,52 @@ export class ReviewController {
 
   explainPath(abs: string): Promise<import('../engineClient.ts').PathExplanation> {
     return this.engine.explainPath(abs, this.repos, this.refs, this.shadowDir)
+  }
+
+  // ---- baseline history / batch rollback ----
+
+  private async pushHistory(b: StoredBaseline): Promise<void> {
+    const hist = this.memento.get<StoredBaseline[]>(KEY_HISTORY, []).filter((x) => x.id !== b.id)
+    hist.unshift(b)
+    await this.memento.update(KEY_HISTORY, hist.slice(0, HISTORY_CAP))
+  }
+
+  history(): StoredBaseline[] {
+    return this.memento.get<StoredBaseline[]>(KEY_HISTORY, [])
+  }
+
+  // Make a HISTORICAL baseline the review base (disk untouched): the change list then
+  // shows the CUMULATIVE diff since that baseline — review or batch-revert from there.
+  switchBaseline(id: string): Promise<void> {
+    return this.serialize(async () => {
+      const target = id === this.baselineId ? undefined : this.history().find((b) => b.id === id)
+      if (!target) return
+      const current = this.memento.get<StoredBaseline>(KEY_BASELINE)
+      if (current) await this.pushHistory(current)
+      this.refs = target.refs
+      this.baselineId = target.id
+      this.baselineAt = target.at
+      this.reviewed.clear()
+      await this.memento.update(KEY_BASELINE, target)
+      this.log.info(`switched review baseline -> ${target.id}`)
+      await this.doRefresh()
+    })
+  }
+
+  // Batch rollback: revert EVERY repo to the current review baseline. Only agent-attributed
+  // added files are deleted; unknown/user adds are kept (they reappear in the list after).
+  revertAll(): Promise<void> {
+    return this.serialize(async () => {
+      const present = this.refs.filter((r) => this.repos.some((x) => x.repoRoot === r.repoRoot))
+      for (const ref of present) {
+        const agentAdded = this.items
+          .filter((i) => i.repoRoot === ref.repoRoot && i.status === 'add' && this.classify(i).attribution === 'agent')
+          .map((i) => i.path)
+        await this.engine.revertRepo(ref.repoRoot, this.refs, this.items, this.repos, this.shadowDir, agentAdded)
+        this.log.info(`revertAll: ${ref.repoRoot} done (${agentAdded.length} agent-added deleted)`)
+      }
+      await this.doRefresh()
+    })
   }
 
   dispose(): void {

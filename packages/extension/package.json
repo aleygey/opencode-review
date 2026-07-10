@@ -2,7 +2,7 @@
   "name": "oc-review",
   "displayName": "OC Review — opencode change review",
   "description": "Review, navigate and roll back opencode's edits across nested git repos; inline diff marks and quick-ask about any selection.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "aleygey",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/aleygey/opencode-review" },
@@ -22,32 +22,41 @@
       ]
     },
     "commands": [
-      { "command": "ocReview.connect", "title": "OC Review: Connect to opencode Server" },
-      { "command": "ocReview.checkpoint", "title": "OC Review: Checkpoint Now (New Baseline)", "icon": "$(history)" },
-      { "command": "ocReview.refresh", "title": "OC Review: Refresh Changes", "icon": "$(refresh)" },
-      { "command": "ocReview.acceptAll", "title": "OC Review: Accept All (New Baseline)", "icon": "$(check-all)" },
-      { "command": "ocReview.openDiff", "title": "OC Review: Open Diff" },
-      { "command": "ocReview.revertFile", "title": "OC Review: Revert File to Baseline", "icon": "$(discard)" },
-      { "command": "ocReview.revertHunk", "title": "OC Review: Revert This Hunk", "icon": "$(discard)" },
-      { "command": "ocReview.revertRepo", "title": "OC Review: Revert Entire Repo to Baseline" },
-      { "command": "ocReview.markReviewed", "title": "OC Review: Toggle Reviewed" },
-      { "command": "ocReview.nextChange", "title": "OC Review: Next Change" },
-      { "command": "ocReview.prevChange", "title": "OC Review: Previous Change" },
-      { "command": "ocReview.toggleInline", "title": "OC Review: Toggle Inline Change Marks" },
-      { "command": "ocReview.quickAsk", "title": "OC Review: Ask opencode About Selection" },
+      { "command": "ocReview.connect", "category": "OC Review", "title": "Connect to opencode Server" },
+      { "command": "ocReview.checkpoint", "category": "OC Review", "title": "Checkpoint Now (New Baseline)", "icon": "$(history)" },
+      { "command": "ocReview.refresh", "category": "OC Review", "title": "Refresh", "icon": "$(refresh)" },
+      { "command": "ocReview.acceptAll", "category": "OC Review", "title": "Accept All (New Baseline)", "icon": "$(check-all)" },
+      { "command": "ocReview.openDiff", "category": "OC Review", "title": "Diff", "icon": "$(diff)" },
+      { "command": "ocReview.revertFile", "category": "OC Review", "title": "Revert File", "icon": "$(discard)" },
+      { "command": "ocReview.revertHunk", "category": "OC Review", "title": "Revert Hunk", "icon": "$(discard)" },
+      { "command": "ocReview.revertRepo", "category": "OC Review", "title": "Revert Repo" },
+      { "command": "ocReview.revertAll", "category": "OC Review", "title": "Revert All to Baseline" },
+      { "command": "ocReview.baselines", "category": "OC Review", "title": "Baselines…", "icon": "$(timeline-view-icon)" },
+      { "command": "ocReview.markReviewed", "category": "OC Review", "title": "Toggle Reviewed" },
+      { "command": "ocReview.nextChange", "category": "OC Review", "title": "Next Change" },
+      { "command": "ocReview.prevChange", "category": "OC Review", "title": "Previous Change" },
+      { "command": "ocReview.toggleInline", "category": "OC Review", "title": "Toggle Inline Marks" },
+      { "command": "ocReview.quickAsk", "category": "OC Review", "title": "Ask opencode About Selection" },
       { "command": "ocReview.askSubmit", "title": "问 opencode" },
-      { "command": "ocReview.adoptRepo", "title": "OC Review: Adopt New Repo into Baseline" },
-      { "command": "ocReview.explainPath", "title": "OC Review: Explain Path (why is/isn't it shown)" },
-      { "command": "ocReview.diagnose", "title": "OC Review: Diagnose" }
+      { "command": "ocReview.adoptRepo", "category": "OC Review", "title": "Adopt New Repo into Baseline" },
+      { "command": "ocReview.explainPath", "category": "OC Review", "title": "Explain Path" },
+      { "command": "ocReview.diagnose", "category": "OC Review", "title": "Diagnose" }
     ],
     "menus": {
       "editor/context": [
-        { "command": "ocReview.quickAsk", "when": "editorTextFocus", "group": "ocreview@1" }
+        { "command": "ocReview.quickAsk", "when": "editorTextFocus", "group": "ocreview@1" },
+        { "command": "ocReview.openDiff", "when": "resourcePath in ocReview.changedPaths", "group": "ocreview@2" }
+      ],
+      "explorer/context": [
+        { "command": "ocReview.openDiff", "when": "resourcePath in ocReview.changedPaths", "group": "3_compare@1" },
+        { "command": "ocReview.revertFile", "when": "resourcePath in ocReview.changedPaths", "group": "3_compare@2" }
       ],
       "view/title": [
         { "command": "ocReview.checkpoint", "when": "view == ocReview.changes", "group": "navigation@1" },
         { "command": "ocReview.refresh", "when": "view == ocReview.changes", "group": "navigation@2" },
-        { "command": "ocReview.acceptAll", "when": "view == ocReview.changes", "group": "navigation@3" }
+        { "command": "ocReview.acceptAll", "when": "view == ocReview.changes", "group": "navigation@3" },
+        { "command": "ocReview.baselines", "when": "view == ocReview.changes", "group": "1_more@1" },
+        { "command": "ocReview.revertAll", "when": "view == ocReview.changes", "group": "1_more@2" }
       ],
       "view/item/context": [
         { "command": "ocReview.openDiff", "when": "view == ocReview.changes && viewItem == file", "group": "inline@1" },

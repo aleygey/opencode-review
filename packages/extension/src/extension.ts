@@ -10,6 +10,7 @@ import { ChangesTree, type Node } from './review/tree.ts'
 import { BaselineDocProvider, SCHEME, openDiff } from './review/diffdoc.ts'
 import { InlineMarks } from './review/decorations.ts'
 import { RevertLensProvider } from './review/codelens.ts'
+import { ChangedFileDecorations } from './review/filedecor.ts'
 import { nextChange, gotoStop } from './review/navigation.ts'
 import { AskThreads } from './quickask/ask.ts'
 import { extractToolEvent } from './lib/sse.ts'
@@ -26,7 +27,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const stubs = [
       'connect', 'checkpoint', 'refresh', 'acceptAll', 'openDiff', 'revertFile', 'revertHunk',
       'revertRepo', 'markReviewed', 'nextChange', 'prevChange', 'toggleInline', 'quickAsk', 'diagnose', 'gotoHunk',
-      'adoptRepo', 'explainPath', 'askSubmit',
+      'adoptRepo', 'explainPath', 'askSubmit', 'revertAll', 'baselines',
     ]
     for (const c of stubs) {
       ctx.subscriptions.push(
@@ -59,8 +60,14 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   const marks = new InlineMarks(controller)
   ctx.subscriptions.push(marks)
   ctx.subscriptions.push(vscode.languages.registerCodeLensProvider({ scheme: 'file' }, new RevertLensProvider(controller)))
+  ctx.subscriptions.push(vscode.window.registerFileDecorationProvider(new ChangedFileDecorations(controller)))
   const askThreads = new AskThreads(() => client, agentWrites, workspaceRoot, log)
   ctx.subscriptions.push(askThreads)
+
+  // Context key so Explorer context-menu entries only appear on files that actually changed.
+  controller.onDidChange((s) => {
+    void vscode.commands.executeCommand('setContext', 'ocReview.changedPaths', s.items.map((i) => i.abs))
+  })
 
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90)
   status.command = 'ocReview.changes.focus'
@@ -181,21 +188,22 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     await controller.refresh()
   })
 
-  const itemOf = (node: Node | ReviewItem | undefined): ReviewItem | undefined => {
+  const itemOf = (node: Node | ReviewItem | vscode.Uri | undefined): ReviewItem | undefined => {
     if (!node) return undefined
+    if (node instanceof vscode.Uri) return controller.itemFor(node.fsPath) // Explorer context menu
     if ((node as any).kind === 'file') return (node as Extract<Node, { kind: 'file' }>).item
     if ((node as any).kind === 'hunk') return (node as Extract<Node, { kind: 'hunk' }>).item
     if ((node as any).abs) return node as ReviewItem
     return undefined
   }
 
-  reg('ocReview.openDiff', async (node?: Node) => {
+  reg('ocReview.openDiff', async (node?: Node | vscode.Uri) => {
     const item = itemOf(node) ?? controller.itemFor(vscode.window.activeTextEditor?.document.uri.fsPath ?? '')
     if (!item) return
     await openDiff(controller, item)
   })
 
-  reg('ocReview.revertFile', async (node?: Node) => {
+  reg('ocReview.revertFile', async (node?: Node | vscode.Uri) => {
     const item = itemOf(node)
     if (!item) return
     let allowCoTouched = false
@@ -271,6 +279,79 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   reg('ocReview.markReviewed', (node?: Node) => {
     const item = itemOf(node)
     if (item) controller.toggleReviewed(item)
+  })
+
+  // Batch rollback: everything in every repo back to the current review baseline.
+  const confirmRevertAll = async (): Promise<boolean> => {
+    const s = controller.state()
+    const risky = s.items.filter((i) => i.status !== 'add' && i.attribution !== 'agent')
+    const adds = s.items.filter((i) => i.status === 'add' && i.attribution === 'agent').length
+    const msg =
+      `把整个工作区回退到基线 ${s.baselineId}?共 ${s.items.length} 个文件的改动将被撤销` +
+      (adds ? `,其中 ${adds} 个 agent 新增文件会被删除` : '') +
+      `。非 agent 新增的文件会保留。` +
+      (risky.length
+        ? ` ⚠ ${risky.length} 个文件含未归属为 opencode 的改动,也会被覆盖: ${risky.slice(0, 3).map((i) => i.path).join(', ')}${risky.length > 3 ? ', …' : ''}`
+        : '')
+    const yes = await vscode.window.showWarningMessage(msg, { modal: true }, '全部回退')
+    return yes === '全部回退'
+  }
+
+  reg('ocReview.revertAll', async () => {
+    await controller.refresh()
+    if (controller.state().items.length === 0) {
+      void vscode.window.showInformationMessage('OC Review: 没有可回退的改动。')
+      return
+    }
+    if (!(await confirmRevertAll())) return
+    try {
+      await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'OC Review: 批量回退中…' }, () =>
+        controller.revertAll(),
+      )
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`批量回退失败: ${e?.message ?? e}`)
+    }
+  })
+
+  // Baseline history: pick one -> view cumulative diff since it, or revert workspace to it.
+  reg('ocReview.baselines', async () => {
+    const s = controller.state()
+    const hist = controller.history()
+    const items: (vscode.QuickPickItem & { id?: string })[] = [
+      ...(s.baselineId
+        ? [{ label: `$(circle-filled) ${new Date(s.baselineAt ?? 0).toLocaleString()}`, description: `${s.baselineId} · 当前审查基线`, id: undefined }]
+        : []),
+      ...hist.map((b) => ({
+        label: `$(history) ${new Date(b.at).toLocaleString()}`,
+        description: `${b.id} · ${b.refs.length} repo(s)`,
+        id: b.id,
+      })),
+    ]
+    if (items.length === 0) {
+      void vscode.window.showInformationMessage('OC Review: 还没有任何基线。')
+      return
+    }
+    const picked = await vscode.window.showQuickPick(items, { placeHolder: '基线历史 — 选一个基线' })
+    if (!picked || !picked.id) return
+    const action = await vscode.window.showQuickPick(
+      [
+        { label: '$(eye) 设为审查基线', detail: '不动磁盘 — 变更列表切换为「自该基线以来的累计改动」,可逐项审查或再批量回退', act: 'switch' },
+        { label: '$(discard) 回退工作区到此基线', detail: '先切换审查基线,再把所有仓库批量恢复到该基线内容(有确认)', act: 'revert' },
+      ] as (vscode.QuickPickItem & { act: string })[],
+      { placeHolder: `对基线 ${picked.id} 做什么?` },
+    )
+    if (!action) return
+    await controller.switchBaseline(picked.id)
+    if (action.act === 'revert') {
+      if (!(await confirmRevertAll())) return
+      try {
+        await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'OC Review: 回退到历史基线…' }, () =>
+          controller.revertAll(),
+        )
+      } catch (e: any) {
+        void vscode.window.showErrorMessage(`回退失败: ${e?.message ?? e}`)
+      }
+    }
   })
 
   reg('ocReview.gotoHunk', (abs: string, line: number) => gotoStop({ abs, line }))

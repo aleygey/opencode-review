@@ -24,12 +24,12 @@ export class RevertLensProvider implements vscode.CodeLensProvider {
     lenses.push(
       new vscode.CodeLens(top, {
         command: 'ocReview.openDiff',
-        title: `$(diff) OC 对比基线 (${item.status}${item.attribution === 'agent' ? '' : ` · ${item.attribution}`})`,
+        title: `$(diff) diff${item.attribution === 'agent' ? '' : ` · ${item.attribution}`}`,
         arguments: [item],
       }),
       new vscode.CodeLens(top, {
         command: 'ocReview.revertFile',
-        title: '$(discard) OC 撤销整个文件',
+        title: '$(discard) 撤销文件',
         arguments: [item],
       }),
     )
@@ -39,7 +39,7 @@ export class RevertLensProvider implements vscode.CodeLensProvider {
       lenses.push(
         new vscode.CodeLens(new vscode.Range(line, 0, line, 0), {
           command: 'ocReview.revertHunk',
-          title: '$(discard) OC 撤销此块',
+          title: '$(discard) 撤销块',
           arguments: [item, index],
         }),
       )

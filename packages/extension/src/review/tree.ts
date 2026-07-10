@@ -97,9 +97,21 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         const it = node.item
         const h = it.hunks[node.index]
         const line = hunkFirstLine(h.header, h.body)
-        const t = new vscode.TreeItem(`@@ line ${line + 1}`)
+        let adds = 0
+        let dels = 0
+        let snippet = ''
+        for (const l of h.body.split('\n')) {
+          if (l.startsWith('+')) {
+            adds++
+            if (!snippet) snippet = l.slice(1).trim()
+          } else if (l.startsWith('-')) {
+            dels++
+            if (!snippet) snippet = l.slice(1).trim()
+          }
+        }
+        const t = new vscode.TreeItem(`L${line + 1} · ${adds ? `+${adds}` : ''}${adds && dels ? ' ' : ''}${dels ? `−${dels}` : ''}`)
         t.iconPath = new vscode.ThemeIcon('list-selection')
-        t.description = h.header.replace(/^@@ | @@.*$/g, '')
+        t.description = snippet.slice(0, 40)
         t.contextValue = 'hunk'
         t.id = `hunk:${it.repoRoot}:${it.path}:${node.index}`
         const md = new vscode.MarkdownString()
