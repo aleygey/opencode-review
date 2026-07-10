@@ -303,6 +303,25 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     log.info('--- end diagnose ---')
   })
 
+  // ---- filesystem fallback ----
+  // When opencode work happens on a server we are NOT connected to (e.g. a standalone TUI
+  // with its own port), no SSE events arrive. A workspace watcher keeps the change list
+  // fresh anyway — degraded mode is then: manual "Checkpoint Now" before the task,
+  // automatic refresh after (attribution shows "unverified", which is accurate).
+  const watcher = vscode.workspace.createFileSystemWatcher('**/*')
+  const onFs = (uri: vscode.Uri) => {
+    if (uri.scheme !== 'file') return
+    const p = uri.fsPath
+    if (p.includes(`${path.sep}.git${path.sep}`) || p.endsWith(`${path.sep}.git`)) return
+    if (p.includes(`${path.sep}node_modules${path.sep}`)) return
+    if (!controller.hasBaseline()) return
+    controller.scheduleRefresh(2000)
+  }
+  watcher.onDidChange(onFs)
+  watcher.onDidCreate(onFs)
+  watcher.onDidDelete(onFs)
+  ctx.subscriptions.push(watcher)
+
   // ---- startup ----
   renderStatus()
   void connect(false)
