@@ -5,6 +5,7 @@ import { hunkFirstLine } from '../lib/hunkmap.ts'
 
 export type Node =
   | { kind: 'info'; label: string; desc?: string; warn?: boolean }
+  | { kind: 'newRepo'; repoRoot: string; rel: string; agentCreated: boolean }
   | { kind: 'repo'; repoRoot: string; rel: string; items: ReviewItem[] }
   | { kind: 'file'; item: ReviewItem }
   | { kind: 'hunk'; item: ReviewItem; index: number }
@@ -51,6 +52,18 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
           : new vscode.ThemeIcon('info')
         t.contextValue = 'info'
         if (node.warn) t.tooltip = node.desc
+        return t
+      }
+      case 'newRepo': {
+        const t = new vscode.TreeItem(`⚠ 新仓库未纳入基线: ${node.rel}`)
+        t.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'))
+        t.description = node.agentCreated ? 'agent 创建 — 点击采纳(当前内容成为基线)' : '点击采纳(当前内容成为基线)'
+        t.tooltip =
+          '这个 git 仓库是在基线之后出现的,没有 checkpoint,里面的改动现在不可见。\n' +
+          '点击把它以「当前内容」纳入基线 — 之后的改动才可审查/回滚。\n' +
+          (node.agentCreated ? '⚠ 检测到它是 agent 创建的:采纳=接受 agent 当前的全部输出为基线。' : '')
+        t.contextValue = 'newRepo'
+        t.command = { command: 'ocReview.adoptRepo', title: 'Adopt Repo', arguments: [node] }
         return t
       }
       case 'repo': {
@@ -117,7 +130,13 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         desc: 'worktree gone — baseline is safe in the shadow store; restore the folder (git init/clone), then Refresh',
         warn: true,
       }))
-      if (s.items.length === 0) return [info, ...missing, { kind: 'info', label: 'No changes since baseline' }]
+      const fresh: Node[] = (s.newRepos ?? []).map((m) => ({
+        kind: 'newRepo' as const,
+        repoRoot: m.repoRoot,
+        rel: m.rel,
+        agentCreated: m.agentCreated,
+      }))
+      if (s.items.length === 0) return [info, ...missing, ...fresh, { kind: 'info', label: 'No changes since baseline' }]
       const byRepo = new Map<string, ReviewItem[]>()
       for (const it of s.items) {
         const list = byRepo.get(it.repoRoot) ?? []
@@ -132,7 +151,7 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
           rel: s.repos.find((r) => r.repoRoot === repoRoot)?.relToWorkspace ?? path.basename(repoRoot),
           items: items.sort((a, b) => a.path.localeCompare(b.path)),
         }))
-      return [info, ...missing, ...repoNodes]
+      return [info, ...missing, ...fresh, ...repoNodes]
     }
     if (node.kind === 'repo') return node.items.map((item) => ({ kind: 'file' as const, item }))
     if (node.kind === 'file') return node.item.hunks.map((_, index) => ({ kind: 'hunk' as const, item: node.item, index }))

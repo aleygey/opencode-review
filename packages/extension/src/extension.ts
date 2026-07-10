@@ -9,8 +9,9 @@ import { ReviewController, type ReviewItem } from './review/controller.ts'
 import { ChangesTree, type Node } from './review/tree.ts'
 import { BaselineDocProvider, SCHEME, openDiff } from './review/diffdoc.ts'
 import { InlineMarks } from './review/decorations.ts'
+import { RevertLensProvider } from './review/codelens.ts'
 import { nextChange, gotoStop } from './review/navigation.ts'
-import { quickAsk } from './quickask/ask.ts'
+import { AskThreads } from './quickask/ask.ts'
 import { extractToolEvent } from './lib/sse.ts'
 
 let client: OpencodeClient | undefined
@@ -25,6 +26,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const stubs = [
       'connect', 'checkpoint', 'refresh', 'acceptAll', 'openDiff', 'revertFile', 'revertHunk',
       'revertRepo', 'markReviewed', 'nextChange', 'prevChange', 'toggleInline', 'quickAsk', 'diagnose', 'gotoHunk',
+      'adoptRepo', 'explainPath', 'askSubmit',
     ]
     for (const c of stubs) {
       ctx.subscriptions.push(
@@ -56,6 +58,9 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   ctx.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider(SCHEME, baselineDocs))
   const marks = new InlineMarks(controller)
   ctx.subscriptions.push(marks)
+  ctx.subscriptions.push(vscode.languages.registerCodeLensProvider({ scheme: 'file' }, new RevertLensProvider(controller)))
+  const askThreads = new AskThreads(() => client, agentWrites, workspaceRoot, log)
+  ctx.subscriptions.push(askThreads)
 
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90)
   status.command = 'ocReview.changes.focus'
@@ -214,9 +219,12 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     }
   })
 
-  reg('ocReview.revertHunk', async (node?: Node) => {
-    if (!node || (node as any).kind !== 'hunk') return
-    const h = node as Extract<Node, { kind: 'hunk' }>
+  reg('ocReview.revertHunk', async (a?: any, b?: number) => {
+    // Accepts a tree hunk node OR (item, index) from a CodeLens / inline icon.
+    let h: { item: ReviewItem; index: number } | undefined
+    if (a?.kind === 'hunk') h = { item: a.item, index: a.index }
+    else if (a?.abs && typeof b === 'number') h = { item: a as ReviewItem, index: b }
+    if (!h) return
     const attr = h.item.attribution
     const msg =
       attr === 'agent'
@@ -274,7 +282,54 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     void vscode.window.setStatusBarMessage(`OC Review inline marks: ${on ? 'on' : 'off'}`, 2000)
   })
 
-  reg('ocReview.quickAsk', () => quickAsk(client, workspaceRoot, ctx.workspaceState, log))
+  reg('ocReview.quickAsk', () => askThreads.openAtSelection())
+  reg('ocReview.askSubmit', (reply: vscode.CommentReply) => askThreads.submit(reply))
+
+  reg('ocReview.adoptRepo', async (node?: any) => {
+    const repoRoot: string | undefined = node?.repoRoot
+    if (!repoRoot) return
+    const rel: string = node?.rel ?? repoRoot
+    const msg = node?.agentCreated
+      ? `仓库 "${rel}" 是 agent 在基线之后创建的。采纳=接受它当前的全部内容为基线(采纳前的内容无法回滚)。继续?`
+      : `把新仓库 "${rel}" 以当前内容纳入基线?(之后的改动才可审查/回滚)`
+    const yes = await vscode.window.showWarningMessage(msg, { modal: true }, '纳入基线')
+    if (yes !== '纳入基线') return
+    try {
+      await controller.adoptRepo(repoRoot)
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`采纳失败: ${e?.message ?? e}`)
+    }
+  })
+
+  reg('ocReview.explainPath', async () => {
+    const ed = vscode.window.activeTextEditor
+    const abs = ed?.document.uri.scheme === 'file' ? ed.document.uri.fsPath : undefined
+    if (!abs) {
+      void vscode.window.showInformationMessage('OC Review: 先打开一个文件再运行 Explain Path。')
+      return
+    }
+    try {
+      await controller.ensureRepos()
+      const x = await controller.explainPath(abs)
+      const lines = [`路径: ${abs}`]
+      if (!x.owned) lines.push('❌ 不属于任何已发现的 git 仓库(不在审查范围内)')
+      else {
+        lines.push(`所属仓库: ${x.repoRoot}(相对路径 ${x.rel})`)
+        if (x.underNestedChild) lines.push(`⚠ 位于嵌套子仓库 "${x.underNestedChild}" 内 — 由那个仓库负责,不算此仓库的改动`)
+        if (x.ignored) lines.push(`⚠ 被 .gitignore 忽略 → 引擎不会跟踪它: ${x.ignored}`)
+        lines.push(x.repoHasBaseline ? '仓库有基线 ✓' : '⚠ 该仓库没有基线(基线之后才出现?) → 改动不可见,树里应有“新仓库”警告,点击采纳')
+        if (x.inBaseline !== undefined) lines.push(x.inBaseline ? '文件存在于基线中(改动会显示为 mod/del)' : '文件不在基线中(改动会显示为 add)')
+      }
+      const item = controller.itemFor(abs)
+      lines.push(item ? `当前变更列表: 有(${item.status}, ${item.attribution})` : '当前变更列表: 无')
+      log.show()
+      log.info('--- explain path ---')
+      for (const l of lines) log.info(l)
+      void vscode.window.showInformationMessage(lines.join('\n'), { modal: true })
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Explain Path 失败: ${e?.message ?? e}`)
+    }
+  })
 
   reg('ocReview.diagnose', async () => {
     log.show()

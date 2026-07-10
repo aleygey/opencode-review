@@ -20,6 +20,9 @@ export type ReviewState = {
   repos: RepoInfo[]
   items: ReviewItem[]
   missingRepos: { repoRoot: string; rel: string }[] // repos in the baseline whose worktree vanished
+  // Repos discovered AFTER the baseline was taken (e.g. a repo cloned/created mid-session).
+  // They have no checkpoint, so their changes are INVISIBLE until adopted — must be surfaced.
+  newRepos: { repoRoot: string; rel: string; agentCreated: boolean }[]
 }
 
 const KEY_BASELINE = 'ocReview.baseline.v1'
@@ -34,6 +37,7 @@ export class ReviewController {
   private baselineAt: number | undefined
   private items: ReviewItem[] = []
   private missingRepos: { repoRoot: string; rel: string }[] = []
+  private newRepos: { repoRoot: string; rel: string; agentCreated: boolean }[] = []
   private reviewed = new Set<string>() // `${repoRoot}\0${path}`
   private refreshTimer: NodeJS.Timeout | undefined
 
@@ -76,6 +80,7 @@ export class ReviewController {
       repos: this.repos,
       items: this.items,
       missingRepos: this.missingRepos,
+      newRepos: this.newRepos,
     }
   }
 
@@ -169,6 +174,16 @@ export class ReviewController {
       this.missingRepos = this.refs
         .filter((r) => !present.includes(r))
         .map((r) => ({ repoRoot: r.repoRoot, rel: path.relative(this.workspaceRoot, r.repoRoot).split(path.sep).join('/') || '.' }))
+      // Repos that appeared after the baseline: no checkpoint -> collect skips them AND the
+      // parent excludes them as a nested child -> their changes are completely invisible.
+      // Surface them so the user can adopt them into the baseline (review feedback issue #1).
+      this.newRepos = this.repos
+        .filter((r) => !this.refs.some((x) => x.repoRoot === r.repoRoot))
+        .map((r) => ({
+          repoRoot: r.repoRoot,
+          rel: r.relToWorkspace,
+          agentCreated: this.agentWrites.hasUnder(r.repoRoot),
+        }))
       const raw = await this.engine.collect(present, this.repos, this.shadowDir)
       this.items = raw.map((it) => this.classify(it))
       this._onDidChange.fire(this.state())
@@ -271,6 +286,30 @@ export class ReviewController {
 
   async baselineContent(item: Pick<ReviewItem, 'repoRoot' | 'path'>): Promise<{ exists: boolean; binary?: boolean; text?: string }> {
     return this.engine.baselineContent(item.repoRoot, item.path, this.refs, this.shadowDir)
+  }
+
+  // Bring a repo that appeared after the baseline into it (checkpoint = its CURRENT content).
+  // Caller must confirm with the user first — for an agent-created repo this accepts the
+  // agent's current output as baseline (nothing before adoption is revertable).
+  adoptRepo(repoRoot: string): Promise<void> {
+    return this.serialize(async () => {
+      if (!this.baselineId) throw new Error('no baseline to adopt into')
+      const repo = this.repos.find((r) => r.repoRoot === repoRoot)
+      if (!repo) throw new Error(`repo not found: ${repoRoot}`)
+      const refs = await this.engine.checkpoint([repo], this.shadowDir, this.baselineId)
+      this.refs = [...this.refs.filter((r) => r.repoRoot !== repoRoot), ...refs]
+      await this.memento.update(KEY_BASELINE, {
+        id: this.baselineId,
+        at: this.baselineAt ?? Date.now(),
+        refs: this.refs,
+      } satisfies StoredBaseline)
+      this.log.info(`adopted repo into baseline ${this.baselineId}: ${repoRoot}`)
+      await this.doRefresh()
+    })
+  }
+
+  explainPath(abs: string): Promise<import('../engineClient.ts').PathExplanation> {
+    return this.engine.explainPath(abs, this.repos, this.refs, this.shadowDir)
   }
 
   dispose(): void {

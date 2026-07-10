@@ -11,7 +11,7 @@ import {
   ensureCommitPresent,
 } from '../../git-engine/src/index.ts'
 import type { RepoInfo, CheckpointRef, ChangeItem, Hunk } from '../../git-engine/src/index.ts'
-import { gitText, gitBuffer, gitOk } from '../../git-engine/src/git.ts'
+import { gitText, gitBuffer, gitOk, runGit as runGitAllowFail } from '../../git-engine/src/git.ts'
 
 type Req = { id: number; op: string; args: any }
 type Res = { id: number; ok: boolean; result?: any; error?: string }
@@ -58,6 +58,33 @@ function handle(op: string, a: any): any {
       const probe = buf.subarray(0, 8000)
       const binary = probe.includes(0)
       return { exists: true, binary, text: binary ? '' : buf.toString('utf8') }
+    }
+    case 'explainPath': {
+      // Why is (or isn't) this path showing up? Owning repo, gitignore verdict, baseline presence.
+      const abs = String(a.abs).split('\\').join('/')
+      const repos = a.repos as RepoInfo[]
+      const owner = repos
+        .filter((r) => abs === r.repoRoot || abs.startsWith(r.repoRoot + '/'))
+        .sort((x, y) => y.repoRoot.length - x.repoRoot.length)[0]
+      if (!owner) return { owned: false }
+      const rel = abs === owner.repoRoot ? '.' : abs.slice(owner.repoRoot.length + 1)
+      const underNested = owner.nestedChildren.find((c) => rel === c || rel.startsWith(c + '/'))
+      const ig = runGitAllowFail(['check-ignore', '-v', '--no-index', '--', rel], owner.repoRoot)
+      const ref = (a.refs as CheckpointRef[]).find((r) => r.repoRoot === owner.repoRoot)
+      let inBaseline: boolean | undefined
+      if (ref && rel !== '.') {
+        ensureCommitPresent(owner.repoRoot, ref, a.shadowDir)
+        inBaseline = gitOk(['rev-parse', '-q', '--verify', `${ref.commit}:${rel}`], owner.repoRoot)
+      }
+      return {
+        owned: true,
+        repoRoot: owner.repoRoot,
+        rel,
+        underNestedChild: underNested,
+        ignored: ig.status === 0 ? ig.stdout.toString('utf8').trim() : undefined,
+        repoHasBaseline: Boolean(ref),
+        inBaseline,
+      }
     }
     case 'headContent': {
       // Current-HEAD content (fallback diff base when no checkpoint covers the file).

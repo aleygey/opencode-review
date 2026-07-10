@@ -1,146 +1,144 @@
 import * as vscode from 'vscode'
-import * as path from 'node:path'
 import type { OpencodeClient } from '../opencode/client.ts'
+import type { AgentWriteStore } from '../opencode/agentWrites.ts'
 import type { Log } from '../log.ts'
-import { AskPanel } from './panel.ts'
-import { extractTextDelta, parseModelString } from '../lib/sse.ts'
 import { normcase } from '../lib/pathcase.ts'
 
-const LAST_SESSION_KEY = 'ocReview.ask.lastSession'
+// Quick-ask as INLINE COMMENT THREADS (VSCode Comments API) — the closest native thing
+// to "a dialog next to the cursor". No webview panel, no session picker, no model config:
+//  - the thread opens at the selection / clicked line,
+//  - the question goes to the session that last WROTE this file (fallback: last active
+//    session in this workspace; fallback: a new session),
+//  - the model is whatever that session already uses (server default),
+//  - the answer comes back as a reply in the thread (and in the opencode TUI, since it
+//    is the same session).
+export class AskThreads {
+  private readonly cc: vscode.CommentController
+  private readonly sessionByThread = new WeakMap<vscode.CommentThread, string>()
+  private readonly selectionByThread = new WeakMap<vscode.CommentThread, string>()
 
-async function pickSession(client: OpencodeClient, workspaceRoot: string, memento: vscode.Memento): Promise<string | undefined> {
-  let sessions: Awaited<ReturnType<OpencodeClient['listSessions']>> = []
-  try {
-    sessions = await client.listSessions()
-  } catch (e: any) {
-    void vscode.window.showErrorMessage(`OC Review: cannot list sessions: ${e?.message ?? e}`)
-    return undefined
+  constructor(
+    private readonly getClient: () => OpencodeClient | undefined,
+    private readonly agentWrites: AgentWriteStore,
+    private readonly workspaceRoot: string,
+    private readonly log: Log,
+  ) {
+    this.cc = vscode.comments.createCommentController('ocReviewAsk', 'OC Review — 问 opencode')
+    this.cc.options = { placeHolder: '问 opencode:为什么这样改?这段什么作用?…', prompt: '发送' }
+    // Every line of every local file can host an ask-thread (the gutter “+” affordance).
+    this.cc.commentingRangeProvider = {
+      provideCommentingRanges: (doc) =>
+        doc.uri.scheme === 'file' ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : [],
+    }
   }
-  const ws = normcase(workspaceRoot)
-  const inWs = sessions.filter((s) => !s.directory || normcase(s.directory).startsWith(ws) || ws.startsWith(normcase(s.directory)))
-  const items: (vscode.QuickPickItem & { sid?: string; create?: boolean })[] = [
-    ...inWs.slice(0, 12).map((s) => ({
-      label: s.title || s.id,
-      description: s.directory,
-      detail: s.updated ? new Date(s.updated).toLocaleString() : undefined,
-      sid: s.id,
-    })),
-    { label: '$(add) New quick-ask session', create: true },
-  ]
-  const last = memento.get<string>(LAST_SESSION_KEY)
-  if (last) {
-    const i = items.findIndex((x) => x.sid === last)
-    if (i > 0) items.unshift(items.splice(i, 1)[0])
+
+  // Ctrl+Alt+A: open a thread at the current selection and remember the selected code.
+  openAtSelection(): void {
+    const ed = vscode.window.activeTextEditor
+    if (!ed || ed.document.uri.scheme !== 'file') {
+      void vscode.window.showInformationMessage('OC Review: 先在文件里选中代码/放好光标。')
+      return
+    }
+    const line = ed.selection.end.line
+    const thread = this.cc.createCommentThread(ed.document.uri, new vscode.Range(line, 0, line, 0), [])
+    thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded
+    thread.canReply = true
+    thread.label = '问 opencode'
+    if (!ed.selection.isEmpty) this.selectionByThread.set(thread, ed.document.getText(ed.selection))
   }
-  const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Ask in which opencode session?' })
-  if (!picked) return undefined
-  if (picked.create) {
+
+  private async resolveSession(client: OpencodeClient, absFile: string): Promise<string | undefined> {
+    // 1) the session that last wrote this file
+    const bySession = this.agentWrites.sessionFor(absFile)
+    if (bySession) return bySession
+    // 2) the most recently observed writing session in this window
+    const last = this.agentWrites.lastSession()
+    if (last) return last
+    // 3) most recent server session whose directory matches this workspace
     try {
-      return await client.createSession('VSCode quick-ask', workspaceRoot)
+      const ws = normcase(this.workspaceRoot)
+      const sessions = await client.listSessions()
+      const match = sessions.find(
+        (s) => !s.directory || normcase(s.directory).startsWith(ws) || ws.startsWith(normcase(s.directory)),
+      )
+      if (match) return match.id
     } catch (e: any) {
-      void vscode.window.showErrorMessage(`OC Review: cannot create session: ${e?.message ?? e}`)
+      this.log.warn(`listSessions failed: ${e?.message ?? e}`)
+    }
+    // 4) fresh session
+    try {
+      return await client.createSession('VSCode quick-ask', this.workspaceRoot)
+    } catch (e: any) {
+      this.log.error(`createSession failed: ${e?.message ?? e}`)
       return undefined
     }
   }
-  return picked.sid
-}
 
-export async function quickAsk(client: OpencodeClient | undefined, workspaceRoot: string, memento: vscode.Memento, log: Log): Promise<void> {
-  if (!client) {
-    void vscode.window.showWarningMessage('OC Review: not connected to an opencode server (run "OC Review: Connect").')
-    return
-  }
-  const ed = vscode.window.activeTextEditor
-  if (!ed) {
-    void vscode.window.showInformationMessage('OC Review: open a file and select code to ask about.')
-    return
-  }
-
-  // Selection, or current line as fallback — works on changed AND unchanged code.
-  const sel = ed.selection.isEmpty ? ed.document.lineAt(ed.selection.active.line).range : new vscode.Range(ed.selection.start, ed.selection.end)
-  const code = ed.document.getText(sel)
-  const rel = vscode.workspace.asRelativePath(ed.document.uri, false)
-  const startLine = sel.start.line + 1
-  const endLine = sel.end.line + 1
-
-  const question = await vscode.window.showInputBox({
-    prompt: `Ask opencode about ${rel}:${startLine}-${endLine}`,
-    placeHolder: 'e.g. 为什么这里要这样改?这段的作用是什么?',
-    ignoreFocusOut: true,
-  })
-  if (!question) return
-
-  const sessionID = await pickSession(client, workspaceRoot, memento)
-  if (!sessionID) return
-  await memento.update(LAST_SESSION_KEY, sessionID)
-
-  const lang = ed.document.languageId
-  const prompt = [
-    `[VSCode quick-ask] About \`${rel}\` lines ${startLine}-${endLine}:`,
-    '```' + lang,
-    code.length > 12000 ? code.slice(0, 12000) + '\n…(truncated)' : code,
-    '```',
-    '',
-    question,
-    '',
-    'Answer concisely. Do NOT edit any files for this question.',
-  ].join('\n')
-
-  const panel = AskPanel.show()
-  panel.startQuestion(`${rel}:${startLine}-${endLine}\n${question}`)
-
-  const abort = new AbortController()
-  // Named handler so finally{} can clear it without clobbering a NEWER quick-ask's
-  // handler on this singleton panel (closing the panel later must not abort an
-  // unrelated in-flight turn).
-  const stopHandler = () => {
-    abort.abort()
-    void client.abortSession(sessionID)
-    panel.status('stopped')
-  }
-  panel.onStop = stopHandler
-
-  // Live streaming: mirror text-part deltas for this session while the prompt call runs.
-  // Progress is tracked PER PART — a session can emit several text parts (and echoes our
-  // own prompt), and one cumulative counter conflates them.
-  let streamedTotal = 0
-  const partSeen = new Map<string, number>()
-  const unsub = client.onEvent((evt) => {
-    if (evt.type !== 'message.part.updated') return
-    const d = extractTextDelta(evt.props)
-    if (!d || d.sessionID !== sessionID) return
-    const part = evt.props?.part
-    if (part?.synthetic) return
-    if (d.text && d.text.startsWith('[VSCode quick-ask]')) return // echo of our own prompt
-    const pid = String(part?.id ?? 'anon')
-    const seen = partSeen.get(pid) ?? 0
-    if (d.delta) {
-      partSeen.set(pid, seen + d.delta.length)
-      streamedTotal += d.delta.length
-      panel.appendAnswer(d.delta)
-    } else if (d.text && d.text.length > seen) {
-      const chunk = d.text.slice(seen)
-      partSeen.set(pid, d.text.length)
-      streamedTotal += chunk.length
-      panel.appendAnswer(chunk)
+  // Bound to the thread's send button (receives vscode.CommentReply).
+  async submit(reply: vscode.CommentReply): Promise<void> {
+    const client = this.getClient()
+    const thread = reply.thread
+    const question = reply.text.trim()
+    if (!question) return
+    if (!client) {
+      this.append(thread, 'OC Review', '未连接 opencode server — 先跑 "OC Review: Connect"。')
+      return
     }
-  })
 
-  const model = parseModelString(vscode.workspace.getConfiguration('ocReview').get<string>('askModel', ''))
-  try {
-    panel.status('waiting for answer…')
-    const res = await client.prompt(sessionID, prompt, model, abort.signal)
-    if (res.text.length > 0) panel.setAnswer(res.text)
-    else if (streamedTotal === 0) panel.setAnswer('(empty answer — check the OC Review output channel)')
-    else panel.status('done')
-  } catch (e: any) {
-    if (!abort.signal.aborted) {
-      log.error(`quick-ask failed: ${e?.message ?? e}`)
-      panel.status(`error: ${String(e?.message ?? e).slice(0, 160)}`)
-      void vscode.window.showErrorMessage(`OC Review ask failed: ${String(e?.message ?? e).slice(0, 200)}`)
+    const doc = await vscode.workspace.openTextDocument(thread.uri)
+    const rel = vscode.workspace.asRelativePath(thread.uri, false)
+    const line = thread.range?.start.line ?? 0
+    const selected = this.selectionByThread.get(thread)
+    const code = selected ?? doc.lineAt(Math.min(line, doc.lineCount - 1)).text
+    const lang = doc.languageId
+
+    this.append(thread, '你', question)
+    this.append(thread, 'opencode', '⏳ 已发送,等待回答…(同一 session,opencode 终端里也能看到)')
+
+    const sessionID = this.sessionByThread.get(thread) ?? (await this.resolveSession(client, thread.uri.fsPath))
+    if (!sessionID) {
+      this.replaceLast(thread, 'opencode', '找不到可用 session,也无法创建 — 看 OC Review 输出面板。')
+      return
     }
-  } finally {
-    unsub()
-    if (panel.onStop === stopHandler) panel.onStop = undefined
+    this.sessionByThread.set(thread, sessionID)
+
+    const prompt = [
+      `关于 \`${rel}\` 第 ${line + 1} 行附近的代码:`,
+      '```' + lang,
+      code.length > 12000 ? code.slice(0, 12000) + '\n…(truncated)' : code,
+      '```',
+      '',
+      question,
+      '',
+      '请简明回答。不要为这个问题修改任何文件。',
+    ].join('\n')
+
+    try {
+      const res = await client.prompt(sessionID, prompt, undefined, new AbortController().signal)
+      this.replaceLast(thread, 'opencode', res.text.trim() || '(空回答 — 看 OC Review 输出面板)')
+    } catch (e: any) {
+      this.log.error(`quick-ask failed: ${e?.message ?? e}`)
+      this.replaceLast(thread, 'opencode', `❌ 失败: ${String(e?.message ?? e).slice(0, 300)}`)
+    }
+  }
+
+  private mkComment(author: string, body: string): vscode.Comment {
+    const md = new vscode.MarkdownString(body)
+    md.isTrusted = false
+    return { author: { name: author }, body: md, mode: vscode.CommentMode.Preview }
+  }
+
+  private append(thread: vscode.CommentThread, author: string, body: string): void {
+    thread.comments = [...thread.comments, this.mkComment(author, body)]
+  }
+
+  private replaceLast(thread: vscode.CommentThread, author: string, body: string): void {
+    const list = [...thread.comments]
+    list[list.length - 1] = this.mkComment(author, body)
+    thread.comments = list
+  }
+
+  dispose(): void {
+    this.cc.dispose()
   }
 }

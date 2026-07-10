@@ -19,6 +19,15 @@ export type ChangeItem = {
   coTouchedByUser?: boolean
 }
 export type BlobContent = { exists: boolean; binary?: boolean; text?: string }
+export type PathExplanation = {
+  owned: boolean
+  repoRoot?: string
+  rel?: string
+  underNestedChild?: string
+  ignored?: string // matching .gitignore rule when ignored
+  repoHasBaseline?: boolean
+  inBaseline?: boolean
+}
 
 type Pending = { resolve: (v: any) => void; reject: (e: Error) => void }
 
@@ -93,6 +102,9 @@ export class EngineClient {
   }
   baselineContent(repoRoot: string, relPath: string, refs: CheckpointRef[], shadowDir: string): Promise<BlobContent> {
     return this.call('baselineContent', { repoRoot, relPath, refs, shadowDir })
+  }
+  explainPath(abs: string, repos: RepoInfo[], refs: CheckpointRef[], shadowDir: string): Promise<PathExplanation> {
+    return this.call('explainPath', { abs, repos, refs, shadowDir })
   }
 
   dispose(): void {
