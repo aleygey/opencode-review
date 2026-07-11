@@ -12,6 +12,9 @@ export type ReviewItem = ChangeItem & {
   abs: string
   attribution: Attribution
   reviewed: boolean
+  // Display-level move pairing: this 'rename' row absorbs a byte-identical delete row.
+  // Revert still executes as delete+add underneath (safe model, SPEC T11).
+  movedFrom?: ReviewItem
 }
 
 export type ReviewState = {
@@ -197,12 +200,53 @@ export class ReviewController {
         }))
       const raw = await this.engine.collect(present, this.repos, this.shadowDir)
       this.items = raw.map((it) => this.classify(it))
+      await this.pairMoves()
       this._onDidChange.fire(this.state())
       this.log.info(`collect: ${this.items.length} changed file(s)${this.missingRepos.length ? `; ${this.missingRepos.length} MISSING repo(s)` : ''}`)
       return true
     } catch (e: any) {
       this.log.error(`refresh failed: ${e?.message ?? e}`)
       return false
+    }
+  }
+
+  // A pure MOVE arrives from the engine as delete+add (--no-renames keeps revert safe —
+  // git's rename detection can couple unrelated same-content files, SPEC T11). That reads
+  // as confusing duplication in the tree, so pair BYTE-IDENTICAL del+add rows into one
+  // 'moved' row for display. Moves-with-edits keep their honest D + A rows.
+  private async pairMoves(): Promise<void> {
+    const dels = this.items.filter((i) => i.status === 'del' && !i.isBinary)
+    if (dels.length === 0) return
+    const adds = this.items.filter((i) => i.status === 'add' && !i.isBinary)
+    for (const del of dels) {
+      const base = del.path.split('/').pop()
+      const cands = adds.filter(
+        (a) => a.repoRoot === del.repoRoot && a.path.split('/').pop() === base && !a.movedFrom,
+      )
+      if (cands.length === 0) continue
+      let baseline: { exists: boolean; binary?: boolean; text?: string }
+      try {
+        baseline = await this.baselineContent(del)
+      } catch {
+        continue
+      }
+      if (!baseline.exists || baseline.binary) continue
+      for (const a of cands) {
+        let cur: string
+        try {
+          cur = fs.readFileSync(a.abs, 'utf8')
+        } catch {
+          continue
+        }
+        if (cur === baseline.text) {
+          a.status = 'rename'
+          a.oldPath = del.path
+          a.movedFrom = del
+          a.hunks = [] // whole-file "+" hunks vs empty baseline are meaningless for a pure move
+          this.items = this.items.filter((x) => x !== del)
+          break
+        }
+      }
     }
   }
 
@@ -322,6 +366,20 @@ export class ReviewController {
   // Every revert returns the affected abs paths (for agent notification) and records a
   // byte-level pre/post snapshot for undo/redo.
   revertFile(item: ReviewItem, allowCoTouched: boolean): Promise<string[]> {
+    // A paired move reverts BOTH halves atomically: delete the moved-to file, restore the
+    // original location — one undo entry.
+    if (item.movedFrom) {
+      return this.serialize(async () => {
+        const del = item.movedFrom!
+        const paths = [item.abs, del.abs]
+        const pre = this.captureFiles(paths)
+        await this.engine.revertFile({ ...item, status: 'add', oldPath: undefined, movedFrom: undefined }, this.refs, this.repos, this.shadowDir, allowCoTouched)
+        await this.engine.revertFile(del, this.refs, this.repos, this.shadowDir, allowCoTouched)
+        this.pushUndo(`还原移动 ${del.path} → ${item.path}`, pre, this.captureFiles(paths))
+        await this.doRefresh()
+        return paths
+      })
+    }
     return this.serialize(async () => {
       const fresh = this.classify(item)
       if (fresh.coTouchedByUser && !item.coTouchedByUser && !allowCoTouched) {

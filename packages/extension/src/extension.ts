@@ -308,7 +308,11 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       if (yes !== 'Revert anyway') return
       allowCoTouched = true
     } else {
-      const verb = item.status === 'add' ? 'Delete this agent-added file' : 'Revert to baseline'
+      const verb = item.movedFrom
+        ? `还原移动(删除 ${item.path},恢复 ${item.movedFrom.path})`
+        : item.status === 'add'
+          ? 'Delete this agent-added file'
+          : 'Revert to baseline'
       const yes = await vscode.window.showWarningMessage(`${verb}: ${item.path}?`, { modal: true }, 'Revert')
       if (yes !== 'Revert') return
     }

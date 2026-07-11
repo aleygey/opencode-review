@@ -145,8 +145,12 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         const dir = path.dirname(it.path)
         const badges: string[] = []
         if (node.showDir && dir && dir !== '.') badges.push(dir)
-        const pm = plusMinus(it)
-        if (pm) badges.push(pm)
+        if (it.status === 'rename' && it.oldPath) {
+          badges.push(`moved ← ${it.oldPath}`)
+        } else {
+          const pm = plusMinus(it)
+          if (pm) badges.push(pm)
+        }
         if (it.attribution === 'co-touched') badges.push('⚠ co-touched')
         else if (it.attribution === 'unverified') badges.push('unverified')
         if (it.reviewed) badges.push('✓')

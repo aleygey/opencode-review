@@ -2,7 +2,7 @@
   "name": "oc-review",
   "displayName": "OC Review — opencode change review",
   "description": "Review, navigate and roll back opencode's edits across nested git repos; inline diff marks and quick-ask about any selection.",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "publisher": "aleygey",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/aleygey/opencode-review" },
