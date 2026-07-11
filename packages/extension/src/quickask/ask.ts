@@ -36,6 +36,8 @@ export class AskThreads {
     private readonly workspaceRoot: string,
     private readonly memento: vscode.Memento,
     private readonly log: Log,
+    // Block-level owner lookup (line blame): ask the session that WROTE the selected lines.
+    private readonly ownerForLines?: (abs: string, lines: number[]) => Promise<string | undefined>,
   ) {
     this.cc = vscode.comments.createCommentController('ocReviewAsk', 'OC Review — 问 opencode')
     this.cc.options = { placeHolder: '问 opencode(Enter 发送,Shift+Enter 换行)', prompt: '问 opencode' }
@@ -64,7 +66,16 @@ export class AskThreads {
     this.threads.push(thread)
   }
 
-  private async resolveSession(client: OpencodeClient, absFile: string): Promise<string | undefined> {
+  private async resolveSession(client: OpencodeClient, absFile: string, lines?: number[]): Promise<string | undefined> {
+    // Most precise first: the session that wrote THESE lines (line blame).
+    if (this.ownerForLines && lines && lines.length) {
+      try {
+        const owner = await this.ownerForLines(absFile, lines)
+        if (owner) return owner
+      } catch {
+        /* fall through */
+      }
+    }
     const bySession = this.agentWrites.sessionFor(absFile)
     if (bySession) return bySession
     const last = this.agentWrites.lastSession()
@@ -121,7 +132,10 @@ export class AskThreads {
     this.append(thread, '你', question)
     this.append(thread, 'opencode', '⏳ 已发送,等待回答…(同一 session,opencode 终端里也能看到)')
 
-    const sessionID = this.sessionByThread.get(thread) ?? (await this.resolveSession(client, thread.uri.fsPath))
+    const threadLines: number[] = []
+    if (thread.range) for (let l = thread.range.start.line; l <= thread.range.end.line; l++) threadLines.push(l)
+    const sessionID =
+      this.sessionByThread.get(thread) ?? (await this.resolveSession(client, thread.uri.fsPath, threadLines))
     if (!sessionID) {
       this.replaceLast(thread, 'opencode', '找不到可用 session,也无法创建 — 看 OC Review 输出面板。')
       return

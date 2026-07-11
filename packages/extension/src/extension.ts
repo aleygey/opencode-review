@@ -11,6 +11,7 @@ import { BaselineDocProvider, SCHEME, openDiff } from './review/diffdoc.ts'
 import { InlineMarks } from './review/decorations.ts'
 import { RevertLensProvider } from './review/codelens.ts'
 import { ChangedFileDecorations } from './review/filedecor.ts'
+import { Attribution } from './review/attribution.ts'
 import { nextChange, gotoStop } from './review/navigation.ts'
 import { AskThreads } from './quickask/ask.ts'
 import { extractToolEvent } from './lib/sse.ts'
@@ -61,22 +62,26 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   ctx.subscriptions.push(marks)
   ctx.subscriptions.push(vscode.languages.registerCodeLensProvider({ scheme: 'file' }, new RevertLensProvider(controller)))
   ctx.subscriptions.push(vscode.window.registerFileDecorationProvider(new ChangedFileDecorations(controller)))
-  const askThreads = new AskThreads(() => client, agentWrites, workspaceRoot, ctx.workspaceState, log)
+  const attribution = new Attribution(controller, agentWrites, log)
+  const askThreads = new AskThreads(() => client, agentWrites, workspaceRoot, ctx.workspaceState, log, (abs, lines) =>
+    attribution.ownerForLines(abs, lines),
+  )
   ctx.subscriptions.push(askThreads)
 
   // Keep the agent's world-model in sync: after the user reverts/undoes files, tell the
   // owning session (context-only, no model turn) so it re-reads before further edits.
   // Explicit feedback so the user can CONFIRM delivery: status bar on success, warning on
   // failure or when no owning session is known.
-  const notifyAgent = (paths: string[], action: string): void => {
+  const notifyAgent = (paths: string[], action: string, targets?: Map<string, string[]>): void => {
     if (!client || paths.length === 0) return
     if (!cfg().get<boolean>('notifyAgent', true)) return
     const bySession = new Map<string, string[]>()
     const orphans: string[] = []
     for (const p of paths) {
-      // Notify EVERY session that wrote this file, not only the last writer — with
-      // concurrent sessions each holds its own stale world-model.
-      let sids = agentWrites.sessionsFor(p)
+      // Precise block/file-level targets when the caller computed them (line blame);
+      // otherwise every session that wrote this file — never fewer than the truth needs.
+      let sids = targets?.get(p) ?? []
+      if (sids.length === 0) sids = agentWrites.sessionsFor(p)
       if (sids.length === 0) {
         const last = agentWrites.lastSession()
         if (last) sids = [last]
@@ -277,8 +282,9 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       if (yes !== 'Revert') return
     }
     try {
+      const targets = new Map([[item.abs, await attribution.ownersForFile(item)]])
       const paths = await controller.revertFile(item, allowCoTouched)
-      notifyAgent(paths, '回退(revert)')
+      notifyAgent(paths, '回退(revert)', targets)
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Revert failed: ${e?.message ?? e}`)
     }
@@ -298,8 +304,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const yes = await vscode.window.showWarningMessage(msg, { modal: true }, 'Revert hunk')
     if (yes !== 'Revert hunk') return
     try {
+      // Block-precise: only the session that WROTE this hunk gets told (falls back to all writers).
+      const targets = new Map([[h.item.abs, await attribution.ownersForHunk(h.item, h.index)]])
       const paths = await controller.revertHunk(h.item, h.index)
-      notifyAgent(paths, '回退(revert)其中一个改动块于')
+      notifyAgent(paths, '回退(revert)其中一个改动块于', targets)
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Hunk revert failed: ${e?.message ?? e}`)
     }
@@ -328,8 +336,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     )
     if (!choice) return
     try {
+      const targets = new Map<string, string[]>()
+      for (const it of r.items) targets.set(it.abs, await attribution.ownersForFile(it))
       const paths = await controller.revertRepo(r.repoRoot, choice === 'Revert + delete agent-added')
-      notifyAgent(paths, '整仓库回退(revert)')
+      notifyAgent(paths, '整仓库回退(revert)', targets)
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Repo revert failed: ${e?.message ?? e}`)
     }
@@ -364,11 +374,13 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     }
     if (!(await confirmRevertAll())) return
     try {
+      const targets = new Map<string, string[]>()
+      for (const it of controller.state().items) targets.set(it.abs, await attribution.ownersForFile(it))
       const paths = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'OC Review: 批量回退中…' },
         () => controller.revertAll(),
       )
-      notifyAgent(paths, '批量回退(revert)')
+      notifyAgent(paths, '批量回退(revert)', targets)
     } catch (e: any) {
       void vscode.window.showErrorMessage(`批量回退失败: ${e?.message ?? e}`)
     }
@@ -431,11 +443,13 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     if (action.act === 'revert') {
       if (!(await confirmRevertAll())) return
       try {
+        const targets = new Map<string, string[]>()
+        for (const it of controller.state().items) targets.set(it.abs, await attribution.ownersForFile(it))
         const paths = await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: 'OC Review: 回退到历史基线…' },
           () => controller.revertAll(),
         )
-        notifyAgent(paths, '回退(revert)到历史基线,涉及')
+        notifyAgent(paths, '回退(revert)到历史基线,涉及', targets)
       } catch (e: any) {
         void vscode.window.showErrorMessage(`回退失败: ${e?.message ?? e}`)
       }

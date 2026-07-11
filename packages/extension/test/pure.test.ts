@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseHunkHeader, mapHunkToNewFile, mapFileMarks, hunkFirstLine } from '../src/lib/hunkmap.ts'
 import { SseParser, normalizeOcEvent, extractToolEvent, extractTextDelta, parseModelString } from '../src/lib/sse.ts'
+import { mapLines, blameLines, majorityOwner } from '../src/lib/blame.ts'
 
 // ---------- hunkmap ----------
 
@@ -120,6 +121,44 @@ test('extractTextDelta: session + delta routing', () => {
   assert.equal(d?.sessionID, 's9')
   assert.equal(d?.text, 'hello')
   assert.equal(d?.delta, 'lo')
+})
+
+// ---------- blame ----------
+
+test('mapLines: prefix/suffix kept, middle matched via LCS', () => {
+  const a = ['a', 'b', 'c', 'd']
+  const b = ['a', 'X', 'b', 'c', 'd'] // insert X after a
+  const m = mapLines(a, b)
+  assert.deepEqual(m, [0, -1, 1, 2, 3])
+})
+
+test('blameLines: each session owns the region it introduced', () => {
+  const base = 'a\nb\nc'
+  const owners = blameLines(base, [
+    { sessionID: 's1', content: 'a\nX\nb\nc' }, // s1 inserts X at line 1
+    { sessionID: 's2', content: 'a\nX\nb\nc\nY' }, // s2 appends Y
+  ])
+  assert.deepEqual(owners, [undefined, 's1', undefined, undefined, 's2'])
+  assert.equal(majorityOwner(owners, [1]), 's1')
+  assert.equal(majorityOwner(owners, [4]), 's2')
+  assert.equal(majorityOwner(owners, [0]), undefined) // baseline-era line — no owner
+})
+
+test('blameLines: overwriting a line transfers ownership to the overwriter', () => {
+  const owners = blameLines('a\nb', [
+    { sessionID: 's1', content: 'a\nX\nb' },
+    { sessionID: 's2', content: 'a\nZ\nb' }, // s2 rewrites s1's X
+  ])
+  assert.deepEqual(owners, [undefined, 's2', undefined])
+})
+
+test('blameLines: deleted-marker capture resets the timeline', () => {
+  const MARK = ' gone '
+  const owners = blameLines('a\nb', [
+    { sessionID: 's1', content: MARK }, // s1 deleted the file
+    { sessionID: 's2', content: 'n1\nn2' }, // s2 recreated it
+  ], MARK)
+  assert.deepEqual(owners, ['s2', 's2'])
 })
 
 test('parseModelString', () => {

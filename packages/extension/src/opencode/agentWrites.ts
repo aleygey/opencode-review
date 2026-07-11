@@ -8,7 +8,15 @@ import { normcase } from '../lib/pathcase.ts'
 // because it is compared by identity from this shared constant, not retyped literals).
 export const DELETED_MARKER = ' oc-review:deleted '
 
-type WriteRecord = { content: string; sessionID?: string; sessions: string[] }
+type WriteRecord = {
+  content: string
+  sessionID?: string
+  sessions: string[]
+  history: { sessionID?: string; content: string }[] // every capture this epoch, in order
+  truncated: boolean // history overflowed — line-blame no longer sound, fall back to sessions[]
+}
+
+const HISTORY_CAP = 30
 
 // Records what opencode itself wrote (abs path -> content right after the agent's write,
 // plus WHICH session wrote it — that session is the natural target for quick-ask).
@@ -44,11 +52,19 @@ export class AgentWriteStore {
         // Accumulate EVERY session that ever wrote this file (this epoch) — a revert must
         // be announced to all of them, not just the last writer.
         const sessions = [...new Set([...(prev?.sessions ?? []), ...(sid ? [sid] : [])])]
+        let content: string
         try {
-          this.map.set(key, { content: fs.readFileSync(abs, 'utf8'), sessionID: sid, sessions })
+          content = fs.readFileSync(abs, 'utf8')
         } catch {
-          this.map.set(key, { content: DELETED_MARKER, sessionID: sid, sessions })
+          content = DELETED_MARKER
         }
+        const history = [...(prev?.history ?? []), { sessionID: sid, content }]
+        let truncated = prev?.truncated ?? false
+        while (history.length > HISTORY_CAP) {
+          history.shift()
+          truncated = true
+        }
+        this.map.set(key, { content, sessionID: sid, sessions, history, truncated })
       }, 150),
     )
   }
@@ -93,6 +109,12 @@ export class AgentWriteStore {
   // EVERY session that wrote this file in the current epoch — revert notifications go to all.
   sessionsFor(abs: string): string[] {
     return this.map.get(normcase(abs))?.sessions ?? []
+  }
+
+  // Full capture history for line-blame; truncated=true means attribution is unsound.
+  historyFor(abs: string): { captures: { sessionID?: string; content: string }[]; truncated: boolean } {
+    const r = this.map.get(normcase(abs))
+    return { captures: r?.history ?? [], truncated: r?.truncated ?? false }
   }
 
   // Most recently observed session across ALL writes (fallback quick-ask target).
