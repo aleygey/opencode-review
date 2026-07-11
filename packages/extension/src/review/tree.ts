@@ -10,12 +10,6 @@ export type Node =
   | { kind: 'file'; item: ReviewItem }
   | { kind: 'hunk'; item: ReviewItem; index: number }
 
-function statusIcon(item: ReviewItem): vscode.ThemeIcon {
-  if (item.status === 'add') return new vscode.ThemeIcon('diff-added', new vscode.ThemeColor('gitDecoration.addedResourceForeground'))
-  if (item.status === 'del') return new vscode.ThemeIcon('diff-removed', new vscode.ThemeColor('gitDecoration.deletedResourceForeground'))
-  return new vscode.ThemeIcon('diff-modified', new vscode.ThemeColor('gitDecoration.modifiedResourceForeground'))
-}
-
 function plusMinus(item: ReviewItem): string {
   let a = 0
   let d = 0
@@ -76,21 +70,29 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
       }
       case 'file': {
         const it = node.item
-        const t = new vscode.TreeItem(it.path, it.hunks.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None)
-        t.iconPath = statusIcon(it)
-        const badges: string[] = [plusMinus(it)]
+        // SCM-list convention: label = filename with the ICON THEME's file-type icon
+        // (resourceUri + no iconPath), M/A/D + color rendered by the FileDecorationProvider,
+        // and the directory path as the dimmed description — same-named files in different
+        // OEM directories stay distinguishable.
+        const t = new vscode.TreeItem(
+          vscode.Uri.file(it.abs),
+          it.hunks.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
+        )
+        const dir = path.dirname(it.path)
+        const badges: string[] = []
+        if (dir && dir !== '.') badges.push(dir)
+        const pm = plusMinus(it)
+        if (pm) badges.push(pm)
         if (it.attribution === 'co-touched') badges.push('⚠ co-touched')
         else if (it.attribution === 'unverified') badges.push('unverified')
-        if (it.reviewed) badges.push('✓ reviewed')
-        t.description = badges.filter(Boolean).join('  ')
+        if (it.reviewed) badges.push('✓')
+        t.description = badges.join(' · ')
         t.contextValue = 'file'
         t.id = `file:${it.repoRoot}:${it.path}`
-        t.resourceUri = vscode.Uri.file(it.abs)
         t.tooltip = new vscode.MarkdownString(
-          `**${it.path}**  \nstatus: ${it.status}${it.isBinary ? ' (binary)' : ''}  \nattribution: ${it.attribution}  \nrepo: ${it.repoRoot}`,
+          `**${it.path}**  \nstatus: ${it.status}${it.isBinary ? ' (binary)' : ''}  \nattribution: ${it.attribution}${it.reviewed ? '  \n✓ reviewed' : ''}  \nrepo: ${it.repoRoot}`,
         )
-        t.command = { command: 'ocReview.openDiff', title: 'Open Diff', arguments: [node] }
-        if (it.reviewed) t.iconPath = new vscode.ThemeIcon('check')
+        t.command = { command: 'ocReview.openDiff', title: 'Diff', arguments: [node] }
         return t
       }
       case 'hunk': {
