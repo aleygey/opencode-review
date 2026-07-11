@@ -1,57 +1,18 @@
 import * as vscode from 'vscode'
 import * as path from 'node:path'
 import type { ReviewController, ReviewItem, ReviewState } from './controller.ts'
-import { hunkFirstLine } from '../lib/hunkmap.ts'
+
+// ONE merged, workspace-rooted directory tree. Nested git repos render as ORDINARY
+// folders at their real path (the repo boundary matters for revert scoping, not for
+// reading the tree); files are leaves (no hunk children — hunk-level actions live in
+// the editor: CodeLens + diff-editor arrows).
+export type DirIndex = Map<string, { dirs: string[]; files: { item: ReviewItem; wsPath: string }[] }>
 
 export type Node =
   | { kind: 'info'; label: string; desc?: string; warn?: boolean }
   | { kind: 'newRepo'; repoRoot: string; rel: string; agentCreated: boolean }
-  | { kind: 'repo'; repoRoot: string; rel: string; items: ReviewItem[]; index: DirIndex }
-  | { kind: 'dir'; repoRoot: string; rel: string; index: DirIndex }
-  | { kind: 'file'; item: ReviewItem; showDir: boolean }
-  | { kind: 'hunk'; item: ReviewItem; index: number }
-
-// Directory index per repo: dir rel-path ('' = repo root) -> immediate child dirs + files.
-export type DirIndex = Map<string, { dirs: string[]; files: ReviewItem[] }>
-
-function buildDirIndex(items: ReviewItem[]): DirIndex {
-  const idx: DirIndex = new Map()
-  const ensure = (d: string) => {
-    let e = idx.get(d)
-    if (!e) {
-      e = { dirs: [], files: [] }
-      idx.set(d, e)
-    }
-    return e
-  }
-  ensure('')
-  for (const it of items) {
-    const parts = it.path.split('/')
-    let dir = ''
-    for (let i = 0; i < parts.length - 1; i++) {
-      const child = dir ? `${dir}/${parts[i]}` : parts[i]
-      const parent = ensure(dir)
-      if (!parent.dirs.includes(child)) parent.dirs.push(child)
-      ensure(child)
-      dir = child
-    }
-    ensure(dir).files.push(it)
-  }
-  for (const e of idx.values()) {
-    e.dirs.sort()
-    e.files.sort((a, b) => a.path.localeCompare(b.path))
-  }
-  return idx
-}
-
-function dirEntries(node: { repoRoot: string; rel: string; index: DirIndex }): Node[] {
-  const e = node.index.get(node.rel)
-  if (!e) return []
-  return [
-    ...e.dirs.map((rel) => ({ kind: 'dir' as const, repoRoot: node.repoRoot, rel, index: node.index })),
-    ...e.files.map((item) => ({ kind: 'file' as const, item, showDir: false })),
-  ]
-}
+  | { kind: 'dir'; rel: string; repoRoot?: string; index: DirIndex } // repoRoot set when this dir IS a nested repo root
+  | { kind: 'file'; item: ReviewItem; wsDir?: string }
 
 function plusMinus(item: ReviewItem): string {
   let a = 0
@@ -64,6 +25,36 @@ function plusMinus(item: ReviewItem): string {
   }
   if (item.isBinary) return 'bin'
   return `${a ? `+${a}` : ''}${d ? ` -${d}` : ''}`.trim() || (item.status === 'del' ? 'deleted' : '')
+}
+
+function buildDirIndex(entries: { item: ReviewItem; wsPath: string }[]): DirIndex {
+  const idx: DirIndex = new Map()
+  const ensure = (d: string) => {
+    let e = idx.get(d)
+    if (!e) {
+      e = { dirs: [], files: [] }
+      idx.set(d, e)
+    }
+    return e
+  }
+  ensure('')
+  for (const en of entries) {
+    const parts = en.wsPath.split('/')
+    let dir = ''
+    for (let i = 0; i < parts.length - 1; i++) {
+      const child = dir ? `${dir}/${parts[i]}` : parts[i]
+      const parent = ensure(dir)
+      if (!parent.dirs.includes(child)) parent.dirs.push(child)
+      ensure(child)
+      dir = child
+    }
+    ensure(dir).files.push(en)
+  }
+  for (const e of idx.values()) {
+    e.dirs.sort()
+    e.files.sort((a, b) => a.wsPath.localeCompare(b.wsPath))
+  }
+  return idx
 }
 
 export class ChangesTree implements vscode.TreeDataProvider<Node> {
@@ -87,18 +78,28 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
     return vscode.workspace.getConfiguration('ocReview').get<string>('viewMode', 'tree') === 'tree'
   }
 
+  // workspace-relative path of an item = its repo's rel prefix + repo-relative path
+  private wsPathOf(item: ReviewItem): string {
+    const rel = this.state.repos.find((r) => r.repoRoot === item.repoRoot)?.relToWorkspace ?? ''
+    return !rel || rel === '.' ? item.path : `${rel}/${item.path}`
+  }
+
+  private dirNodes(rel: string, index: DirIndex): Node[] {
+    const e = index.get(rel)
+    if (!e) return []
+    return [
+      ...e.dirs.map((d) => ({
+        kind: 'dir' as const,
+        rel: d,
+        repoRoot: this.state.repos.find((r) => r.relToWorkspace === d)?.repoRoot,
+        index,
+      })),
+      ...e.files.map((f) => ({ kind: 'file' as const, item: f.item })),
+    ]
+  }
+
   getTreeItem(node: Node): vscode.TreeItem {
     switch (node.kind) {
-      case 'dir': {
-        const t = new vscode.TreeItem(
-          vscode.Uri.file(path.join(node.repoRoot, node.rel)),
-          vscode.TreeItemCollapsibleState.Expanded,
-        )
-        t.iconPath = vscode.ThemeIcon.Folder // folder icon from the active icon theme
-        t.contextValue = 'dir'
-        t.id = `dir:${node.repoRoot}:${node.rel}`
-        return t
-      }
       case 'info': {
         const t = new vscode.TreeItem(node.label)
         t.description = node.desc
@@ -121,30 +122,25 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         t.command = { command: 'ocReview.adoptRepo', title: 'Adopt Repo', arguments: [node] }
         return t
       }
-      case 'repo': {
-        const t = new vscode.TreeItem(node.rel === '.' ? '(workspace root)' : node.rel, vscode.TreeItemCollapsibleState.Expanded)
-        t.iconPath = new vscode.ThemeIcon('repo')
-        t.description = `${node.items.length} file(s)`
-        t.contextValue = 'repo'
-        t.id = `repo:${node.repoRoot}`
+      case 'dir': {
+        const t = new vscode.TreeItem(
+          vscode.Uri.file(path.join(this.controller.workspaceRoot, node.rel)),
+          vscode.TreeItemCollapsibleState.Expanded,
+        )
+        t.iconPath = vscode.ThemeIcon.Folder // uniform folder icon — repo boundary is invisible
+        t.contextValue = node.repoRoot ? 'repoDir' : 'dir'
+        t.id = `dir:${node.rel}`
+        if (node.repoRoot) t.tooltip = `${node.rel}\n(独立 git 仓库 — 可整仓库回退)`
         return t
       }
       case 'file': {
         const it = node.item
-        // SCM-list convention: label = filename with the ICON THEME's file-type icon
-        // (resourceUri + no iconPath), M/A/D + color rendered by the FileDecorationProvider,
-        // and the directory path as the dimmed description — same-named files in different
-        // OEM directories stay distinguishable.
-        const t = new vscode.TreeItem(
-          vscode.Uri.file(it.abs),
-          it.hunks.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
-        )
+        const t = new vscode.TreeItem(vscode.Uri.file(it.abs), vscode.TreeItemCollapsibleState.None)
         // Explicit ThemeIcon.File is REQUIRED: with a falsy iconPath a COLLAPSIBLE item
-        // gets the folder icon, not the file-type icon derived from resourceUri.
+        // gets the folder icon; leaves are safe but we stay explicit.
         t.iconPath = vscode.ThemeIcon.File
-        const dir = path.dirname(it.path)
         const badges: string[] = []
-        if (node.showDir && dir && dir !== '.') badges.push(dir)
+        if (node.wsDir) badges.push(node.wsDir)
         if (it.status === 'rename' && it.oldPath) {
           badges.push(`moved ← ${it.oldPath}`)
         } else {
@@ -158,40 +154,9 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         t.contextValue = 'file'
         t.id = `file:${it.repoRoot}:${it.path}`
         t.tooltip = new vscode.MarkdownString(
-          `**${it.path}**  \nstatus: ${it.status}${it.isBinary ? ' (binary)' : ''}  \nattribution: ${it.attribution}${it.reviewed ? '  \n✓ reviewed' : ''}  \nrepo: ${it.repoRoot}`,
+          `**${this.wsPathOf(it)}**  \nstatus: ${it.status}${it.isBinary ? ' (binary)' : ''}  \nattribution: ${it.attribution}${it.reviewed ? '  \n✓ reviewed' : ''}  \nrepo: ${it.repoRoot}`,
         )
         t.command = { command: 'ocReview.openDiff', title: 'Diff', arguments: [node] }
-        return t
-      }
-      case 'hunk': {
-        const it = node.item
-        const h = it.hunks[node.index]
-        const line = hunkFirstLine(h.header, h.body)
-        let adds = 0
-        let dels = 0
-        let snippet = ''
-        for (const l of h.body.split('\n')) {
-          if (l.startsWith('+')) {
-            adds++
-            if (!snippet) snippet = l.slice(1).trim()
-          } else if (l.startsWith('-')) {
-            dels++
-            if (!snippet) snippet = l.slice(1).trim()
-          }
-        }
-        const t = new vscode.TreeItem(`L${line + 1} · ${adds ? `+${adds}` : ''}${adds && dels ? ' ' : ''}${dels ? `−${dels}` : ''}`)
-        t.iconPath = new vscode.ThemeIcon('list-selection')
-        t.description = snippet.slice(0, 40)
-        t.contextValue = 'hunk'
-        t.id = `hunk:${it.repoRoot}:${it.path}:${node.index}`
-        const md = new vscode.MarkdownString()
-        md.appendCodeblock(`${h.header}\n${h.body}`.slice(0, 2000), 'diff')
-        t.tooltip = md
-        t.command = {
-          command: 'ocReview.gotoHunk',
-          title: 'Go to Hunk',
-          arguments: [it.abs, line],
-        }
         return t
       }
     }
@@ -204,11 +169,9 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         return [{ kind: 'info', label: 'No baseline yet', desc: 'Run "OC Review: Checkpoint Now"' }]
       }
       const when = s.baselineAt ? new Date(s.baselineAt).toLocaleTimeString() : ''
-      // The baseline row carries the INTENT of this batch (the turn's user prompt / manual note).
       const info: Node = s.baselineNote
         ? { kind: 'info', label: `📌 ${s.baselineNote}`, desc: when }
         : { kind: 'info', label: `Baseline ${s.baselineId}`, desc: when }
-      // A baseline repo whose worktree disappeared is possible data loss — never hide it.
       const missing: Node[] = (s.missingRepos ?? []).map((m) => ({
         kind: 'info' as const,
         label: `⚠ repo deleted since baseline: ${m.rel}`,
@@ -222,30 +185,21 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         agentCreated: m.agentCreated,
       }))
       if (s.items.length === 0) return [info, ...missing, ...fresh, { kind: 'info', label: 'No changes since baseline' }]
-      const byRepo = new Map<string, ReviewItem[]>()
-      for (const it of s.items) {
-        const list = byRepo.get(it.repoRoot) ?? []
-        list.push(it)
-        byRepo.set(it.repoRoot, list)
+
+      const entries = s.items.map((item) => ({ item, wsPath: this.wsPathOf(item) }))
+      if (!this.treeMode()) {
+        const files: Node[] = entries
+          .sort((a, b) => a.wsPath.localeCompare(b.wsPath))
+          .map((e) => {
+            const d = path.dirname(e.wsPath)
+            return { kind: 'file' as const, item: e.item, wsDir: d === '.' ? undefined : d }
+          })
+        return [info, ...missing, ...fresh, ...files]
       }
-      const repoNodes: Node[] = [...byRepo.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([repoRoot, items]) => ({
-          kind: 'repo' as const,
-          repoRoot,
-          rel: s.repos.find((r) => r.repoRoot === repoRoot)?.relToWorkspace ?? path.basename(repoRoot),
-          items: items.sort((a, b) => a.path.localeCompare(b.path)),
-          index: buildDirIndex(items),
-        }))
-      return [info, ...missing, ...fresh, ...repoNodes]
+      const index = buildDirIndex(entries)
+      return [info, ...missing, ...fresh, ...this.dirNodes('', index)]
     }
-    if (node.kind === 'repo') {
-      // Hierarchical (default): repo -> folders -> files, like the SCM tree view.
-      if (this.treeMode()) return dirEntries({ repoRoot: node.repoRoot, rel: '', index: node.index })
-      return node.items.map((item) => ({ kind: 'file' as const, item, showDir: true }))
-    }
-    if (node.kind === 'dir') return dirEntries(node)
-    if (node.kind === 'file') return node.item.hunks.map((_, index) => ({ kind: 'hunk' as const, item: node.item, index }))
-    return []
+    if (node.kind === 'dir') return this.dirNodes(node.rel, node.index)
+    return [] // files are leaves — hunk actions live in the editor (CodeLens / diff arrows)
   }
 }

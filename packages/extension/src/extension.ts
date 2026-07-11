@@ -284,7 +284,6 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     if (!node) return undefined
     if (node instanceof vscode.Uri) return controller.itemFor(node.fsPath) // Explorer context menu
     if ((node as any).kind === 'file') return (node as Extract<Node, { kind: 'file' }>).item
-    if ((node as any).kind === 'hunk') return (node as Extract<Node, { kind: 'hunk' }>).item
     if ((node as any).abs) return node as ReviewItem
     return undefined
   }
@@ -326,10 +325,9 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   })
 
   reg('ocReview.revertHunk', async (a?: any, b?: number) => {
-    // Accepts a tree hunk node OR (item, index) from a CodeLens / inline icon.
+    // (item, index) from a CodeLens — hunk-level actions live in the editor only.
     let h: { item: ReviewItem; index: number } | undefined
-    if (a?.kind === 'hunk') h = { item: a.item, index: a.index }
-    else if (a?.abs && typeof b === 'number') h = { item: a as ReviewItem, index: b }
+    if (a?.abs && typeof b === 'number') h = { item: a as ReviewItem, index: b }
     if (!h) return
     const attr = h.item.attribution
     if (attr === 'co-touched') {
@@ -354,13 +352,33 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     }
   })
 
-  reg('ocReview.revertRepo', async (node?: Node) => {
-    if (!node || (node as any).kind !== 'repo') return
-    const r = node as Extract<Node, { kind: 'repo' }>
-    const adds = r.items.filter((i) => i.status === 'add' && i.attribution === 'agent').length
+  reg('ocReview.revertRepo', async (node?: any) => {
+    // From the tree: a directory node that IS a repo root (contextValue repoDir).
+    // From the palette: no node — pick among repos that currently have changes.
+    let repoRoot: string | undefined = node?.repoRoot
+    let rel: string | undefined = node?.rel
+    if (!repoRoot) {
+      const s = controller.state()
+      const roots = [...new Set(s.items.map((i) => i.repoRoot))]
+      if (roots.length === 0) {
+        void vscode.window.showInformationMessage('OC Review: 没有可回退的改动。')
+        return
+      }
+      const picks = roots.map((root) => ({
+        label: s.repos.find((x) => x.repoRoot === root)?.relToWorkspace ?? root,
+        description: `${s.items.filter((i) => i.repoRoot === root).length} file(s)`,
+        root,
+      }))
+      const p = await vscode.window.showQuickPick(picks, { placeHolder: '回退哪个仓库?' })
+      if (!p) return
+      repoRoot = p.root
+      rel = p.label
+    }
+    const items = controller.state().items.filter((i) => i.repoRoot === repoRoot)
+    const adds = items.filter((i) => i.status === 'add' && i.attribution === 'agent').length
     // Disclose files whose edits are NOT verified agent output — a repo revert will
     // overwrite those edits too (only non-adds are overwritten; unattributed adds are kept).
-    const risky = r.items.filter((i) => i.status !== 'add' && i.attribution !== 'agent')
+    const risky = items.filter((i) => i.status !== 'add' && i.attribution !== 'agent')
     const riskWarn = risky.length
       ? ` ⚠ ${risky.length} file(s) have edits NOT attributed to opencode and those edits will be LOST: ${risky
           .slice(0, 3)
@@ -368,7 +386,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
           .join(', ')}${risky.length > 3 ? ', …' : ''}.`
       : ''
     const choice = await vscode.window.showWarningMessage(
-      `Revert ENTIRE repo "${r.rel}" to baseline? Modified/deleted files are restored byte-exact.` +
+      `Revert ENTIRE repo "${rel ?? repoRoot}" to baseline? Modified/deleted files are restored byte-exact.` +
         riskWarn +
         (adds ? ` ${adds} agent-added file(s) can also be deleted.` : ''),
       { modal: true },
@@ -378,8 +396,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     if (!choice) return
     try {
       const targets = new Map<string, string[]>()
-      for (const it of r.items) targets.set(it.abs, await attribution.ownersForFile(it))
-      const paths = await controller.revertRepo(r.repoRoot, choice === 'Revert + delete agent-added')
+      for (const it of items) targets.set(it.abs, await attribution.ownersForFile(it))
+      const paths = await controller.revertRepo(repoRoot, choice === 'Revert + delete agent-added')
       notifyAgent(paths, '整仓库回退(revert)', targets)
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Repo revert failed: ${e?.message ?? e}`)
