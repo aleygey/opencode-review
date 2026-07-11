@@ -470,6 +470,38 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     if (yes === '清除') askThreads.clearAll()
   })
 
+  // Per-baseline action flow — shared by the QuickPick command and the sidebar history rows.
+  const baselineActions = async (id: string, hint?: string): Promise<void> => {
+    const action = await vscode.window.showQuickPick(
+      [
+        { label: '$(eye) 设为审查基线', detail: '不动磁盘 — 变更列表切换为「自该基线以来的累计改动」,可逐项审查或再批量回退', act: 'switch' },
+        { label: '$(discard) 回退工作区到此基线', detail: '先切换审查基线,再把所有仓库批量恢复到该基线内容(有确认)', act: 'revert' },
+      ] as (vscode.QuickPickItem & { act: string })[],
+      { placeHolder: `对基线 ${hint ?? id} 做什么?` },
+    )
+    if (!action) return
+    await controller.switchBaseline(id)
+    if (action.act === 'revert') {
+      if (!(await confirmRevertAll())) return
+      try {
+        const targets = new Map<string, string[]>()
+        for (const it of controller.state().items) targets.set(it.abs, await attribution.ownersForFile(it))
+        const paths = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'OC Review: 回退到历史基线…' },
+          () => controller.revertAll(),
+        )
+        notifyAgent(paths, '回退(revert)到历史基线,涉及', targets)
+      } catch (e: any) {
+        void vscode.window.showErrorMessage(`回退失败: ${e?.message ?? e}`)
+      }
+    }
+  }
+
+  // Sidebar history row click.
+  reg('ocReview.baselineActions', (id?: string, hint?: string) => {
+    if (typeof id === 'string' && id.length) void baselineActions(id, hint)
+  })
+
   // Baseline history: pick one -> view cumulative diff since it, or revert workspace to it.
   reg('ocReview.baselines', async () => {
     const s = controller.state()
@@ -491,29 +523,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     }
     const picked = await vscode.window.showQuickPick(items, { placeHolder: '基线历史 — 选一个基线' })
     if (!picked || !picked.id) return
-    const action = await vscode.window.showQuickPick(
-      [
-        { label: '$(eye) 设为审查基线', detail: '不动磁盘 — 变更列表切换为「自该基线以来的累计改动」,可逐项审查或再批量回退', act: 'switch' },
-        { label: '$(discard) 回退工作区到此基线', detail: '先切换审查基线,再把所有仓库批量恢复到该基线内容(有确认)', act: 'revert' },
-      ] as (vscode.QuickPickItem & { act: string })[],
-      { placeHolder: `对基线 ${picked.id} 做什么?` },
-    )
-    if (!action) return
-    await controller.switchBaseline(picked.id)
-    if (action.act === 'revert') {
-      if (!(await confirmRevertAll())) return
-      try {
-        const targets = new Map<string, string[]>()
-        for (const it of controller.state().items) targets.set(it.abs, await attribution.ownersForFile(it))
-        const paths = await vscode.window.withProgress(
-          { location: vscode.ProgressLocation.Notification, title: 'OC Review: 回退到历史基线…' },
-          () => controller.revertAll(),
-        )
-        notifyAgent(paths, '回退(revert)到历史基线,涉及', targets)
-      } catch (e: any) {
-        void vscode.window.showErrorMessage(`回退失败: ${e?.message ?? e}`)
-      }
-    }
+    await baselineActions(picked.id)
   })
 
   reg('ocReview.gotoHunk', (abs: string, line: number) => gotoStop({ abs, line }))

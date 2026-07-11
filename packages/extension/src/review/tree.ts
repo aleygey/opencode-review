@@ -13,6 +13,8 @@ export type Node =
   | { kind: 'newRepo'; repoRoot: string; rel: string; agentCreated: boolean }
   | { kind: 'dir'; rel: string; repoRoot?: string; index: DirIndex } // repoRoot set when this dir IS a nested repo root
   | { kind: 'file'; item: ReviewItem; wsDir?: string }
+  | { kind: 'history'; count: number }
+  | { kind: 'baseline'; id: string; at: number; note?: string; repos: number }
 
 function plusMinus(item: ReviewItem): string {
   let a = 0
@@ -133,6 +135,25 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         if (node.repoRoot) t.tooltip = `${node.rel}\n(独立 git 仓库 — 可整仓库回退)`
         return t
       }
+      case 'history': {
+        const t = new vscode.TreeItem('基线历史', vscode.TreeItemCollapsibleState.Collapsed)
+        t.iconPath = new vscode.ThemeIcon('history')
+        t.description = `${node.count}`
+        t.contextValue = 'history'
+        t.id = 'history'
+        return t
+      }
+      case 'baseline': {
+        const when = new Date(node.at).toLocaleString()
+        const t = new vscode.TreeItem(node.note ? `📌 ${node.note}` : when)
+        t.iconPath = new vscode.ThemeIcon('git-commit')
+        t.description = node.note ? when : `${node.id} · ${node.repos} repo(s)`
+        t.tooltip = `${when}\n${node.id} · ${node.repos} repo(s)${node.note ? `\n📌 ${node.note}` : ''}\n点击:设为审查基线 / 回退到此基线`
+        t.contextValue = 'baseline'
+        t.id = `baseline:${node.id}`
+        t.command = { command: 'ocReview.baselineActions', title: 'Baseline Actions', arguments: [node.id, node.note ?? when] }
+        return t
+      }
       case 'file': {
         const it = node.item
         const t = new vscode.TreeItem(vscode.Uri.file(it.abs), vscode.TreeItemCollapsibleState.None)
@@ -184,7 +205,10 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         rel: m.rel,
         agentCreated: m.agentCreated,
       }))
-      if (s.items.length === 0) return [info, ...missing, ...fresh, { kind: 'info', label: 'No changes since baseline' }]
+      const histCount = this.controller.history().length
+      const tail: Node[] = histCount > 0 ? [{ kind: 'history', count: histCount }] : []
+      if (s.items.length === 0)
+        return [info, ...missing, ...fresh, { kind: 'info', label: 'No changes since baseline' }, ...tail]
 
       const entries = s.items.map((item) => ({ item, wsPath: this.wsPathOf(item) }))
       if (!this.treeMode()) {
@@ -194,12 +218,21 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
             const d = path.dirname(e.wsPath)
             return { kind: 'file' as const, item: e.item, wsDir: d === '.' ? undefined : d }
           })
-        return [info, ...missing, ...fresh, ...files]
+        return [info, ...missing, ...fresh, ...files, ...tail]
       }
       const index = buildDirIndex(entries)
-      return [info, ...missing, ...fresh, ...this.dirNodes('', index)]
+      return [info, ...missing, ...fresh, ...this.dirNodes('', index), ...tail]
     }
     if (node.kind === 'dir') return this.dirNodes(node.rel, node.index)
+    if (node.kind === 'history') {
+      return this.controller.history().map((b) => ({
+        kind: 'baseline' as const,
+        id: b.id,
+        at: b.at,
+        note: b.note,
+        repos: b.refs.length,
+      }))
+    }
     return [] // files are leaves — hunk actions live in the editor (CodeLens / diff arrows)
   }
 }
