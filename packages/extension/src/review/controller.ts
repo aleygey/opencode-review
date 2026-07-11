@@ -373,7 +373,8 @@ export class ReviewController {
         const del = item.movedFrom!
         const paths = [item.abs, del.abs]
         const pre = this.captureFiles(paths)
-        await this.engine.revertFile({ ...item, status: 'add', oldPath: undefined, movedFrom: undefined }, this.refs, this.repos, this.shadowDir, allowCoTouched)
+        const asAdd: ReviewItem = { ...item, status: 'add', oldPath: undefined, movedFrom: undefined }
+        await this.engine.revertFile(asAdd, this.refs, this.repos, this.shadowDir, allowCoTouched)
         await this.engine.revertFile(del, this.refs, this.repos, this.shadowDir, allowCoTouched)
         this.pushUndo(`还原移动 ${del.path} → ${item.path}`, pre, this.captureFiles(paths))
         await this.doRefresh()
