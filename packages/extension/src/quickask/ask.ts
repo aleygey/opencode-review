@@ -39,11 +39,9 @@ export class AskThreads {
   ) {
     this.cc = vscode.comments.createCommentController('ocReviewAsk', 'OC Review — 问 opencode')
     this.cc.options = { placeHolder: '问 opencode(Enter 发送,Shift+Enter 换行)', prompt: '问 opencode' }
-    // Every line of every local file can host an ask-thread (the gutter “+” affordance).
-    this.cc.commentingRangeProvider = {
-      provideCommentingRanges: (doc) =>
-        doc.uri.scheme === 'file' ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : [],
-    }
+    // NO commentingRangeProvider on purpose: it paints a “+” and a gutter bar between the
+    // line numbers and the code on every line, which users found noisy. Threads are created
+    // only via selection + Ctrl+Alt+A / context menu; existing threads render regardless.
     this.restore()
   }
 

@@ -66,23 +66,50 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 
   // Keep the agent's world-model in sync: after the user reverts/undoes files, tell the
   // owning session (context-only, no model turn) so it re-reads before further edits.
+  // Explicit feedback so the user can CONFIRM delivery: status bar on success, warning on
+  // failure or when no owning session is known.
   const notifyAgent = (paths: string[], action: string): void => {
     if (!client || paths.length === 0) return
     if (!cfg().get<boolean>('notifyAgent', true)) return
     const bySession = new Map<string, string[]>()
+    const orphans: string[] = []
     for (const p of paths) {
       const sid = agentWrites.sessionFor(p) ?? agentWrites.lastSession()
-      if (!sid) continue
+      const rel = vscode.workspace.asRelativePath(p, false)
+      if (!sid) {
+        orphans.push(rel)
+        continue
+      }
       const list = bySession.get(sid) ?? []
-      list.push(vscode.workspace.asRelativePath(p, false))
+      list.push(rel)
       bySession.set(sid, list)
     }
-    for (const [sid, rels] of bySession) {
-      void client.notify(
-        sid,
-        `[oc-review] 用户在 VSCode 中${action}了这些文件,磁盘内容已变化(不要假设你之前的编辑仍然存在,修改前请重新读取): ${rels.join(', ')}`,
-      )
-    }
+    void (async () => {
+      let ok = 0
+      let fail = 0
+      for (const [sid, rels] of bySession) {
+        const sent = await client!.notify(
+          sid,
+          `[oc-review] 用户在 VSCode 中${action}了这些文件,磁盘内容已变化(不要假设你之前的编辑仍然存在,修改前请重新读取): ${rels.join(', ')}`,
+        )
+        if (sent) {
+          ok++
+          log.info(`notify ok -> session ${sid}: ${rels.join(', ')}`)
+        } else fail++
+      }
+      if (ok > 0 && fail === 0) {
+        void vscode.window.setStatusBarMessage(`$(check) OC Review: 已同步给 opencode(${ok} 个 session)`, 5000)
+      }
+      if (fail > 0) {
+        void vscode.window.showWarningMessage(
+          'OC Review: 未能把回退信息同步给 opencode(server 可能不支持 noReply)— agent 可能仍认为旧内容在盘上。详见输出面板。',
+        )
+      }
+      if (orphans.length > 0 && bySession.size === 0) {
+        log.warn(`notify skipped — no known session for: ${orphans.join(', ')}`)
+        void vscode.window.setStatusBarMessage('OC Review: 未知归属 session,回退未同步给 agent', 5000)
+      }
+    })()
   }
 
   // Context key so Explorer context-menu entries only appear on files that actually changed.
