@@ -50,6 +50,14 @@ export class BaselineDocProvider implements vscode.TextDocumentContentProvider {
 }
 
 export async function openDiff(controller: ReviewController, item: ReviewItem): Promise<void> {
+  if (item.isBinary) {
+    // A text diff of a compiled artifact is meaningless — say so instead of opening
+    // a diff whose baseline side is just a placeholder string.
+    void vscode.window.showInformationMessage(
+      `「${item.path}」是二进制文件(如编译产物),没有文本 diff。建议把构建产物加进 .gitignore,它们就不会进入审查列表。`,
+    )
+    return
+  }
   const state = controller.state()
   const left = BaselineDocProvider.uriFor(item, state.baselineId ?? 'none')
   const right = vscode.Uri.file(item.abs)

@@ -74,15 +74,23 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const bySession = new Map<string, string[]>()
     const orphans: string[] = []
     for (const p of paths) {
-      const sid = agentWrites.sessionFor(p) ?? agentWrites.lastSession()
+      // Notify EVERY session that wrote this file, not only the last writer — with
+      // concurrent sessions each holds its own stale world-model.
+      let sids = agentWrites.sessionsFor(p)
+      if (sids.length === 0) {
+        const last = agentWrites.lastSession()
+        if (last) sids = [last]
+      }
       const rel = vscode.workspace.asRelativePath(p, false)
-      if (!sid) {
+      if (sids.length === 0) {
         orphans.push(rel)
         continue
       }
-      const list = bySession.get(sid) ?? []
-      list.push(rel)
-      bySession.set(sid, list)
+      for (const sid of sids) {
+        const list = bySession.get(sid) ?? []
+        list.push(rel)
+        bySession.set(sid, list)
+      }
     }
     void (async () => {
       let ok = 0

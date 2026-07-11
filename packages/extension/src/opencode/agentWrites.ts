@@ -8,7 +8,7 @@ import { normcase } from '../lib/pathcase.ts'
 // because it is compared by identity from this shared constant, not retyped literals).
 export const DELETED_MARKER = ' oc-review:deleted '
 
-type WriteRecord = { content: string; sessionID?: string }
+type WriteRecord = { content: string; sessionID?: string; sessions: string[] }
 
 // Records what opencode itself wrote (abs path -> content right after the agent's write,
 // plus WHICH session wrote it — that session is the natural target for quick-ask).
@@ -39,11 +39,15 @@ export class AgentWriteStore {
       key,
       setTimeout(() => {
         this.timers.delete(key)
-        const sid = sessionID ?? this.map.get(key)?.sessionID
+        const prev = this.map.get(key)
+        const sid = sessionID ?? prev?.sessionID
+        // Accumulate EVERY session that ever wrote this file (this epoch) — a revert must
+        // be announced to all of them, not just the last writer.
+        const sessions = [...new Set([...(prev?.sessions ?? []), ...(sid ? [sid] : [])])]
         try {
-          this.map.set(key, { content: fs.readFileSync(abs, 'utf8'), sessionID: sid })
+          this.map.set(key, { content: fs.readFileSync(abs, 'utf8'), sessionID: sid, sessions })
         } catch {
-          this.map.set(key, { content: DELETED_MARKER, sessionID: sid })
+          this.map.set(key, { content: DELETED_MARKER, sessionID: sid, sessions })
         }
       }, 150),
     )
@@ -84,6 +88,11 @@ export class AgentWriteStore {
   // The session that last wrote this file — the natural quick-ask target.
   sessionFor(abs: string): string | undefined {
     return this.map.get(normcase(abs))?.sessionID
+  }
+
+  // EVERY session that wrote this file in the current epoch — revert notifications go to all.
+  sessionsFor(abs: string): string[] {
+    return this.map.get(normcase(abs))?.sessions ?? []
   }
 
   // Most recently observed session across ALL writes (fallback quick-ask target).
