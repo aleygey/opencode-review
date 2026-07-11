@@ -23,10 +23,14 @@ export class ChangedFileDecorations implements vscode.FileDecorationProvider {
         : item.status === 'del'
           ? new vscode.ThemeColor('gitDecoration.deletedResourceForeground')
           : new vscode.ThemeColor('gitDecoration.modifiedResourceForeground')
-    return {
+    const deco = new vscode.FileDecoration(
       badge,
+      `OC Review: ${item.status} (${item.attribution})${item.reviewed ? ' ✓reviewed' : ''}`,
       color,
-      tooltip: `OC Review: ${item.status} (${item.attribution})${item.reviewed ? ' ✓reviewed' : ''}`,
-    }
+    )
+    // Bubble the mark up to collapsed parent FOLDERS (same behavior as git decorations),
+    // so a directory containing changes is visible without expanding it.
+    deco.propagate = true
+    return deco
   }
 }
