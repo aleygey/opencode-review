@@ -94,8 +94,8 @@ export class EngineClient {
   revertFile(item: ChangeItem, refs: CheckpointRef[], repos: RepoInfo[], shadowDir: string, allowCoTouched: boolean): Promise<void> {
     return this.call('revertFile', { item, refs, repos, shadowDir, allowCoTouched })
   }
-  revertHunk(item: ChangeItem, hunk: Hunk, repos: RepoInfo[]): Promise<void> {
-    return this.call('revertHunk', { item, hunk, repos })
+  revertHunk(item: ChangeItem, hunk: Hunk, repos: RepoInfo[], force = false): Promise<void> {
+    return this.call('revertHunk', { item, hunk, repos, force })
   }
   revertRepo(repoRoot: string, refs: CheckpointRef[], changes: ChangeItem[], repos: RepoInfo[], shadowDir: string, agentAdded: string[]): Promise<void> {
     return this.call('revertRepo', { repoRoot, refs, changes, repos, shadowDir, agentAdded })

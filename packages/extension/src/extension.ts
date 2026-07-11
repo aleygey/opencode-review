@@ -29,6 +29,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       'connect', 'checkpoint', 'refresh', 'acceptAll', 'openDiff', 'revertFile', 'revertHunk',
       'revertRepo', 'markReviewed', 'nextChange', 'prevChange', 'toggleInline', 'quickAsk', 'diagnose', 'gotoHunk',
       'adoptRepo', 'explainPath', 'askSubmit', 'revertAll', 'baselines', 'undoRevert', 'redoRevert', 'clearAskThreads',
+      'renameBaseline', 'toggleViewMode',
     ]
     for (const c of stubs) {
       ctx.subscriptions.push(
@@ -159,7 +160,14 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         const sid = evt.props?.sessionID ?? evt.props?.info?.id
         if (busy && sid && !turnSeen.has(sid)) {
           turnSeen.add(sid)
-          if (cfg().get<string>('autoCheckpoint', 'turn') === 'turn') void controller.onTurnStart()
+          if (cfg().get<string>('autoCheckpoint', 'turn') === 'turn') {
+            void (async () => {
+              await controller.onTurnStart()
+              // Baseline intent = the prompt that started this turn.
+              const intent = await client?.lastUserMessage(sid).catch(() => undefined)
+              if (intent) await controller.noteIntent(intent)
+            })()
+          }
         }
         return
       }
@@ -232,12 +240,35 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 
   reg('ocReview.connect', () => connect(true))
 
-  reg('ocReview.checkpoint', () =>
-    vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: 'OC Review: checkpointing…' }, async () => {
-      await controller.newBaseline('manual')
+  reg('ocReview.checkpoint', async () => {
+    const note = await vscode.window.showInputBox({
+      prompt: '这次基线的备注(可选,说明这批改动的意图;直接回车跳过)',
+      ignoreFocusOut: true,
+    })
+    if (note === undefined) return // esc = cancel
+    await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: 'OC Review: checkpointing…' }, async () => {
+      await controller.newBaseline('manual', note.trim() || undefined)
       await controller.refresh()
-    }),
-  )
+    })
+  })
+
+  reg('ocReview.renameBaseline', async () => {
+    const s = controller.state()
+    if (!s.baselineId) return
+    const note = await vscode.window.showInputBox({
+      prompt: `基线 ${s.baselineId} 的备注`,
+      value: s.baselineNote ?? '',
+      ignoreFocusOut: true,
+    })
+    if (note === undefined) return
+    await controller.setBaselineNote(note)
+  })
+
+  reg('ocReview.toggleViewMode', async () => {
+    const cur = cfg().get<string>('viewMode', 'tree')
+    await cfg().update('viewMode', cur === 'tree' ? 'list' : 'tree', vscode.ConfigurationTarget.Workspace)
+    tree.refresh()
+  })
 
   reg('ocReview.refresh', () => controller.refresh())
 
@@ -297,16 +328,22 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     else if (a?.abs && typeof b === 'number') h = { item: a as ReviewItem, index: b }
     if (!h) return
     const attr = h.item.attribution
+    if (attr === 'co-touched') {
+      void vscode.window.showWarningMessage(
+        `"${h.item.path}" 混入了你扫描后的手动修改,块级回退会连你的行一起撤掉 — 请用文件级回退(有单独确认)。`,
+      )
+      return
+    }
     const msg =
       attr === 'agent'
-        ? `Revert this hunk in "${h.item.path}"? This rewrites the file on disk (not undoable from the editor).`
-        : `This hunk in "${h.item.path}" is ${attr} — it may be YOUR edit, not opencode's. Hunk revert only applies to verified agent output.`
-    const yes = await vscode.window.showWarningMessage(msg, { modal: true }, 'Revert hunk')
-    if (yes !== 'Revert hunk') return
+        ? `撤销 "${h.item.path}" 的这个改动块?(直接改写磁盘,可用 Undo Last Revert 撤销)`
+        : `此块归属为 ${attr}(扩展没有观察到 agent 写入,可能是你自己的修改)。确认撤销这个块?`
+    const yes = await vscode.window.showWarningMessage(msg, { modal: true }, '撤销此块')
+    if (yes !== '撤销此块') return
     try {
       // Block-precise: only the session that WROTE this hunk gets told (falls back to all writers).
       const targets = new Map([[h.item.abs, await attribution.ownersForHunk(h.item, h.index)]])
-      const paths = await controller.revertHunk(h.item, h.index)
+      const paths = await controller.revertHunk(h.item, h.index, attr !== 'agent')
       notifyAgent(paths, '回退(revert)其中一个改动块于', targets)
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Hunk revert failed: ${e?.message ?? e}`)
@@ -422,6 +459,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       ...hist.map((b) => ({
         label: `$(history) ${new Date(b.at).toLocaleString()}`,
         description: `${b.id} · ${b.refs.length} repo(s)`,
+        detail: b.note,
         id: b.id,
       })),
     ]

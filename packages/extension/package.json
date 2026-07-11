@@ -2,7 +2,7 @@
   "name": "oc-review",
   "displayName": "OC Review — opencode change review",
   "description": "Review, navigate and roll back opencode's edits across nested git repos; inline diff marks and quick-ask about any selection.",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "publisher": "aleygey",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/aleygey/opencode-review" },
@@ -30,6 +30,8 @@
       { "command": "ocReview.redoRevert", "category": "OC Review", "title": "Redo Revert" },
       { "command": "ocReview.baselines", "category": "OC Review", "title": "Baselines…", "icon": "$(timeline-view-icon)" },
       { "command": "ocReview.clearAskThreads", "category": "OC Review", "title": "Clear Ask Threads" },
+      { "command": "ocReview.renameBaseline", "category": "OC Review", "title": "Rename Baseline (Note)" },
+      { "command": "ocReview.toggleViewMode", "category": "OC Review", "title": "Toggle Tree/List View" },
       { "command": "ocReview.markReviewed", "category": "OC Review", "title": "Toggle Reviewed" },
       { "command": "ocReview.nextChange", "category": "OC Review", "title": "Next Change" },
       { "command": "ocReview.prevChange", "category": "OC Review", "title": "Previous Change" },
@@ -56,7 +58,9 @@
         { "command": "ocReview.baselines", "when": "view == ocReview.changes", "group": "1_more@1" },
         { "command": "ocReview.revertAll", "when": "view == ocReview.changes", "group": "1_more@2" },
         { "command": "ocReview.undoRevert", "when": "view == ocReview.changes", "group": "1_more@3" },
-        { "command": "ocReview.redoRevert", "when": "view == ocReview.changes", "group": "1_more@4" }
+        { "command": "ocReview.redoRevert", "when": "view == ocReview.changes", "group": "1_more@4" },
+        { "command": "ocReview.renameBaseline", "when": "view == ocReview.changes", "group": "1_more@5" },
+        { "command": "ocReview.toggleViewMode", "when": "view == ocReview.changes", "group": "1_more@6" }
       ],
       "view/item/context": [
         { "command": "ocReview.openDiff", "when": "view == ocReview.changes && viewItem == file", "group": "inline@1" },
@@ -95,6 +99,12 @@
           "items": { "type": "number" },
           "default": [4096],
           "description": "Ports probed on 127.0.0.1 during auto-discovery."
+        },
+        "ocReview.viewMode": {
+          "type": "string",
+          "enum": ["tree", "list"],
+          "default": "tree",
+          "description": "Changes view layout: tree = hierarchical folders (like SCM tree view); list = flat with directory shown next to the filename."
         },
         "ocReview.notifyAgent": {
           "type": "boolean",

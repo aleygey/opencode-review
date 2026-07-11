@@ -108,6 +108,28 @@ export class OpencodeClient {
     throw lastErr ?? new Error('prompt failed')
   }
 
+  // Latest REAL user prompt of a session — used as the baseline's intent note.
+  // Skips our own injected texts (oc-review notices, quick-ask prompts).
+  async lastUserMessage(sessionID: string): Promise<string | undefined> {
+    const raw = await this.json<any>('GET', `/session/${encodeURIComponent(sessionID)}/message`)
+    const arr: any[] = Array.isArray(raw) ? raw : Array.isArray(raw?.messages) ? raw.messages : []
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const m = arr[i]
+      const info = m?.info ?? m
+      if ((info?.role ?? '') !== 'user') continue
+      const parts: any[] = Array.isArray(m?.parts) ? m.parts : []
+      const text = parts
+        .filter((p) => p?.type === 'text' && typeof p.text === 'string' && !p.synthetic)
+        .map((p) => p.text)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+      if (!text || text.startsWith('[oc-review]') || text.startsWith('[VSCode quick-ask]') || text.startsWith('关于 `')) continue
+      return text.length > 100 ? text.slice(0, 100) + '…' : text
+    }
+    return undefined
+  }
+
   // Context-only injection: tell the session something WITHOUT triggering a model turn.
   // Used to keep the agent's world-model in sync after the user reverts/redoes files.
   // Best-effort: if this server version rejects noReply we log and drop — never fall

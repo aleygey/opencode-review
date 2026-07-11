@@ -37,7 +37,7 @@ function handle(op: string, a: any): any {
       revertFile(a.item, cpMap(a.refs), a.repos, { shadowDir: a.shadowDir, allowCoTouched: a.allowCoTouched })
       return true
     case 'revertHunk':
-      revertHunk(a.item as ChangeItem, a.hunk as Hunk, a.repos)
+      revertHunk(a.item as ChangeItem, a.hunk as Hunk, a.repos, { force: !!a.force })
       return true
     case 'revertRepo':
       revertRepo(a.repoRoot, cpMap(a.refs), a.changes, a.repos, {

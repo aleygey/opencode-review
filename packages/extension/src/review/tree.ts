@@ -6,9 +6,52 @@ import { hunkFirstLine } from '../lib/hunkmap.ts'
 export type Node =
   | { kind: 'info'; label: string; desc?: string; warn?: boolean }
   | { kind: 'newRepo'; repoRoot: string; rel: string; agentCreated: boolean }
-  | { kind: 'repo'; repoRoot: string; rel: string; items: ReviewItem[] }
-  | { kind: 'file'; item: ReviewItem }
+  | { kind: 'repo'; repoRoot: string; rel: string; items: ReviewItem[]; index: DirIndex }
+  | { kind: 'dir'; repoRoot: string; rel: string; index: DirIndex }
+  | { kind: 'file'; item: ReviewItem; showDir: boolean }
   | { kind: 'hunk'; item: ReviewItem; index: number }
+
+// Directory index per repo: dir rel-path ('' = repo root) -> immediate child dirs + files.
+export type DirIndex = Map<string, { dirs: string[]; files: ReviewItem[] }>
+
+function buildDirIndex(items: ReviewItem[]): DirIndex {
+  const idx: DirIndex = new Map()
+  const ensure = (d: string) => {
+    let e = idx.get(d)
+    if (!e) {
+      e = { dirs: [], files: [] }
+      idx.set(d, e)
+    }
+    return e
+  }
+  ensure('')
+  for (const it of items) {
+    const parts = it.path.split('/')
+    let dir = ''
+    for (let i = 0; i < parts.length - 1; i++) {
+      const child = dir ? `${dir}/${parts[i]}` : parts[i]
+      const parent = ensure(dir)
+      if (!parent.dirs.includes(child)) parent.dirs.push(child)
+      ensure(child)
+      dir = child
+    }
+    ensure(dir).files.push(it)
+  }
+  for (const e of idx.values()) {
+    e.dirs.sort()
+    e.files.sort((a, b) => a.path.localeCompare(b.path))
+  }
+  return idx
+}
+
+function dirEntries(node: { repoRoot: string; rel: string; index: DirIndex }): Node[] {
+  const e = node.index.get(node.rel)
+  if (!e) return []
+  return [
+    ...e.dirs.map((rel) => ({ kind: 'dir' as const, repoRoot: node.repoRoot, rel, index: node.index })),
+    ...e.files.map((item) => ({ kind: 'file' as const, item, showDir: false })),
+  ]
+}
 
 function plusMinus(item: ReviewItem): string {
   let a = 0
@@ -36,8 +79,26 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
     })
   }
 
+  refresh(): void {
+    this._onDidChangeTreeData.fire()
+  }
+
+  private treeMode(): boolean {
+    return vscode.workspace.getConfiguration('ocReview').get<string>('viewMode', 'tree') === 'tree'
+  }
+
   getTreeItem(node: Node): vscode.TreeItem {
     switch (node.kind) {
+      case 'dir': {
+        const t = new vscode.TreeItem(
+          vscode.Uri.file(path.join(node.repoRoot, node.rel)),
+          vscode.TreeItemCollapsibleState.Expanded,
+        )
+        t.iconPath = vscode.ThemeIcon.Folder // folder icon from the active icon theme
+        t.contextValue = 'dir'
+        t.id = `dir:${node.repoRoot}:${node.rel}`
+        return t
+      }
       case 'info': {
         const t = new vscode.TreeItem(node.label)
         t.description = node.desc
@@ -78,9 +139,12 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
           vscode.Uri.file(it.abs),
           it.hunks.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
         )
+        // Explicit ThemeIcon.File is REQUIRED: with a falsy iconPath a COLLAPSIBLE item
+        // gets the folder icon, not the file-type icon derived from resourceUri.
+        t.iconPath = vscode.ThemeIcon.File
         const dir = path.dirname(it.path)
         const badges: string[] = []
-        if (dir && dir !== '.') badges.push(dir)
+        if (node.showDir && dir && dir !== '.') badges.push(dir)
         const pm = plusMinus(it)
         if (pm) badges.push(pm)
         if (it.attribution === 'co-touched') badges.push('⚠ co-touched')
@@ -136,7 +200,10 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         return [{ kind: 'info', label: 'No baseline yet', desc: 'Run "OC Review: Checkpoint Now"' }]
       }
       const when = s.baselineAt ? new Date(s.baselineAt).toLocaleTimeString() : ''
-      const info: Node = { kind: 'info', label: `Baseline ${s.baselineId}`, desc: when }
+      // The baseline row carries the INTENT of this batch (the turn's user prompt / manual note).
+      const info: Node = s.baselineNote
+        ? { kind: 'info', label: `📌 ${s.baselineNote}`, desc: when }
+        : { kind: 'info', label: `Baseline ${s.baselineId}`, desc: when }
       // A baseline repo whose worktree disappeared is possible data loss — never hide it.
       const missing: Node[] = (s.missingRepos ?? []).map((m) => ({
         kind: 'info' as const,
@@ -164,10 +231,16 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
           repoRoot,
           rel: s.repos.find((r) => r.repoRoot === repoRoot)?.relToWorkspace ?? path.basename(repoRoot),
           items: items.sort((a, b) => a.path.localeCompare(b.path)),
+          index: buildDirIndex(items),
         }))
       return [info, ...missing, ...fresh, ...repoNodes]
     }
-    if (node.kind === 'repo') return node.items.map((item) => ({ kind: 'file' as const, item }))
+    if (node.kind === 'repo') {
+      // Hierarchical (default): repo -> folders -> files, like the SCM tree view.
+      if (this.treeMode()) return dirEntries({ repoRoot: node.repoRoot, rel: '', index: node.index })
+      return node.items.map((item) => ({ kind: 'file' as const, item, showDir: true }))
+    }
+    if (node.kind === 'dir') return dirEntries(node)
     if (node.kind === 'file') return node.item.hunks.map((_, index) => ({ kind: 'hunk' as const, item: node.item, index }))
     return []
   }

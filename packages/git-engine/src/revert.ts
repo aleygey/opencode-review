@@ -56,9 +56,14 @@ export function revertFile(
   }
 }
 
-export function revertHunk(item: ChangeItem, hunk: Hunk, repos: RepoInfo[]): void {
-  if (!hunk.agentAttributed) throw new Error('refusing revertHunk: hunk not agent-attributed')
-  if (item.coTouchedByUser) throw new Error('refusing revertHunk: file co-touched by user')
+export function revertHunk(item: ChangeItem, hunk: Hunk, repos: RepoInfo[], opts?: { force?: boolean }): void {
+  // force = caller obtained an EXPLICIT user confirmation for a non-agent-attributed hunk
+  // (e.g. 'unverified' when no write was observed). Co-touched files should still be
+  // refused by the caller — reverse-applying a mixed hunk loses user lines.
+  if (!opts?.force) {
+    if (!hunk.agentAttributed) throw new Error('refusing revertHunk: hunk not agent-attributed')
+    if (item.coTouchedByUser) throw new Error('refusing revertHunk: file co-touched by user')
+  }
   const repo = repoOf(item.repoRoot, repos)
   assertSafeRelPath(item.path, repo.nestedChildren)
 

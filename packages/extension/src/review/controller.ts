@@ -17,6 +17,7 @@ export type ReviewItem = ChangeItem & {
 export type ReviewState = {
   baselineId: string | undefined
   baselineAt: number | undefined
+  baselineNote: string | undefined // intent of this batch of changes (auto: the turn's user prompt)
   repos: RepoInfo[]
   items: ReviewItem[]
   missingRepos: { repoRoot: string; rel: string }[] // repos in the baseline whose worktree vanished
@@ -30,13 +31,14 @@ const KEY_BASELINE_PREV = 'ocReview.baseline.prev.v1' // one-step recovery from 
 const KEY_HISTORY = 'ocReview.baseline.history.v1'
 const HISTORY_CAP = 30
 
-export type StoredBaseline = { id: string; at: number; refs: CheckpointRef[] }
+export type StoredBaseline = { id: string; at: number; refs: CheckpointRef[]; note?: string }
 
 export class ReviewController {
   private repos: RepoInfo[] = []
   private refs: CheckpointRef[] = []
   private baselineId: string | undefined
   private baselineAt: number | undefined
+  private baselineNote: string | undefined
   private items: ReviewItem[] = []
   private missingRepos: { repoRoot: string; rel: string }[] = []
   private newRepos: { repoRoot: string; rel: string; agentCreated: boolean }[] = []
@@ -70,6 +72,7 @@ export class ReviewController {
     if (stored?.id && Array.isArray(stored.refs)) {
       this.baselineId = stored.id
       this.baselineAt = stored.at
+      this.baselineNote = stored.note
       this.refs = stored.refs
       this.log.info(`restored baseline ${stored.id} (${stored.refs.length} repos)`)
     }
@@ -79,6 +82,7 @@ export class ReviewController {
     return {
       baselineId: this.baselineId,
       baselineAt: this.baselineAt,
+      baselineNote: this.baselineNote,
       repos: this.repos,
       items: this.items,
       missingRepos: this.missingRepos,
@@ -108,11 +112,11 @@ export class ReviewController {
   }
 
   // New baseline = checkpoint every repo now; clears review marks.
-  newBaseline(reason: string): Promise<void> {
-    return this.serialize(() => this.doNewBaseline(reason))
+  newBaseline(reason: string, note?: string): Promise<void> {
+    return this.serialize(() => this.doNewBaseline(reason, note))
   }
 
-  private async doNewBaseline(reason: string): Promise<void> {
+  private async doNewBaseline(reason: string, note?: string): Promise<void> {
     // Clear FIRST: agent writes observed while the (slow) checkpoint runs must survive
     // into the new epoch — clearing afterwards wiped mid-checkpoint captures.
     this.agentWrites.clear()
@@ -130,8 +134,9 @@ export class ReviewController {
     this.refs = refs
     this.baselineId = id
     this.baselineAt = Date.now()
+    this.baselineNote = note
     this.reviewed.clear()
-    await this.memento.update(KEY_BASELINE, { id, at: this.baselineAt, refs } satisfies StoredBaseline)
+    await this.memento.update(KEY_BASELINE, { id, at: this.baselineAt, refs, note } satisfies StoredBaseline)
     this.items = []
     this.missingRepos = []
     this._onDidChange.fire(this.state())
@@ -331,11 +336,18 @@ export class ReviewController {
     })
   }
 
-  revertHunk(item: ReviewItem, hunkIndex: number): Promise<string[]> {
+  revertHunk(item: ReviewItem, hunkIndex: number, allowUnverified = false): Promise<string[]> {
     return this.serialize(async () => {
       const fresh = this.classify(item)
-      if (fresh.coTouchedByUser || fresh.attribution !== 'agent') {
-        throw new Error(`'${item.path}' is ${fresh.attribution} — hunk revert only applies to verified agent output; use file revert instead`)
+      // A genuinely co-touched hunk mixes user + agent lines — reverse-applying it loses
+      // the user's lines, so it stays hard-refused (file-level revert has its own guard).
+      if (fresh.attribution === 'co-touched') {
+        throw new Error(`'${item.path}' 混入了扫描后的手动修改 — 块级回退不安全,请用文件级回退`)
+      }
+      // 'unverified' (no observed agent write, e.g. TUI ran unattached) is allowed only
+      // behind the caller's explicit confirmation dialog.
+      if (fresh.attribution !== 'agent' && !allowUnverified) {
+        throw new Error(`'${item.path}' is ${fresh.attribution} — 需要显式确认才能回退非 agent 归属的块`)
       }
       const hunk = fresh.hunks[hunkIndex]
       if (!hunk) throw new Error(`no hunk #${hunkIndex} — the file changed since the last scan; refresh first`)
@@ -343,7 +355,7 @@ export class ReviewController {
       const pre = this.captureFiles(paths)
       // If the on-disk content drifted from the scanned hunk, `git apply -R` fails on
       // context mismatch — a safe, atomic-per-file failure surfaced to the user.
-      await this.engine.revertHunk(fresh, hunk, this.repos)
+      await this.engine.revertHunk(fresh, hunk, this.repos, fresh.attribution !== 'agent')
       this.pushUndo(`撤销块 ${item.path}#${hunkIndex + 1}`, pre, this.captureFiles(paths))
       await this.doRefresh()
       return paths
@@ -384,6 +396,7 @@ export class ReviewController {
         id: this.baselineId,
         at: this.baselineAt ?? Date.now(),
         refs: this.refs,
+        note: this.baselineNote,
       } satisfies StoredBaseline)
       this.log.info(`adopted repo into baseline ${this.baselineId}: ${repoRoot}`)
       await this.doRefresh()
@@ -406,6 +419,36 @@ export class ReviewController {
     return this.memento.get<StoredBaseline[]>(KEY_HISTORY, [])
   }
 
+  private async persistCurrent(): Promise<void> {
+    if (!this.baselineId) return
+    await this.memento.update(KEY_BASELINE, {
+      id: this.baselineId,
+      at: this.baselineAt ?? Date.now(),
+      refs: this.refs,
+      note: this.baselineNote,
+    } satisfies StoredBaseline)
+  }
+
+  // Manual note (Rename Baseline command).
+  async setBaselineNote(note: string): Promise<void> {
+    this.baselineNote = note.trim() || undefined
+    await this.persistCurrent()
+    this._onDidChange.fire(this.state())
+  }
+
+  // Auto-intent: the user prompt that started a turn. First intent names the baseline;
+  // later turns on the same baseline append (deduped, capped) so accumulated reviews
+  // still say what they contain.
+  async noteIntent(intent: string): Promise<void> {
+    const t = intent.trim()
+    if (!t) return
+    if (!this.baselineNote) this.baselineNote = t
+    else if (!this.baselineNote.includes(t)) this.baselineNote = `${this.baselineNote} | ${t}`.slice(0, 160)
+    else return
+    await this.persistCurrent()
+    this._onDidChange.fire(this.state())
+  }
+
   // Make a HISTORICAL baseline the review base (disk untouched): the change list then
   // shows the CUMULATIVE diff since that baseline — review or batch-revert from there.
   switchBaseline(id: string): Promise<void> {
@@ -417,6 +460,7 @@ export class ReviewController {
       this.refs = target.refs
       this.baselineId = target.id
       this.baselineAt = target.at
+      this.baselineNote = target.note
       this.reviewed.clear()
       await this.memento.update(KEY_BASELINE, target)
       this.log.info(`switched review baseline -> ${target.id}`)
