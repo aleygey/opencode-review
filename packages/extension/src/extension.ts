@@ -27,7 +27,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const stubs = [
       'connect', 'checkpoint', 'refresh', 'acceptAll', 'openDiff', 'revertFile', 'revertHunk',
       'revertRepo', 'markReviewed', 'nextChange', 'prevChange', 'toggleInline', 'quickAsk', 'diagnose', 'gotoHunk',
-      'adoptRepo', 'explainPath', 'askSubmit', 'revertAll', 'baselines',
+      'adoptRepo', 'explainPath', 'askSubmit', 'revertAll', 'baselines', 'undoRevert', 'redoRevert', 'clearAskThreads',
     ]
     for (const c of stubs) {
       ctx.subscriptions.push(
@@ -61,8 +61,29 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   ctx.subscriptions.push(marks)
   ctx.subscriptions.push(vscode.languages.registerCodeLensProvider({ scheme: 'file' }, new RevertLensProvider(controller)))
   ctx.subscriptions.push(vscode.window.registerFileDecorationProvider(new ChangedFileDecorations(controller)))
-  const askThreads = new AskThreads(() => client, agentWrites, workspaceRoot, log)
+  const askThreads = new AskThreads(() => client, agentWrites, workspaceRoot, ctx.workspaceState, log)
   ctx.subscriptions.push(askThreads)
+
+  // Keep the agent's world-model in sync: after the user reverts/undoes files, tell the
+  // owning session (context-only, no model turn) so it re-reads before further edits.
+  const notifyAgent = (paths: string[], action: string): void => {
+    if (!client || paths.length === 0) return
+    if (!cfg().get<boolean>('notifyAgent', true)) return
+    const bySession = new Map<string, string[]>()
+    for (const p of paths) {
+      const sid = agentWrites.sessionFor(p) ?? agentWrites.lastSession()
+      if (!sid) continue
+      const list = bySession.get(sid) ?? []
+      list.push(vscode.workspace.asRelativePath(p, false))
+      bySession.set(sid, list)
+    }
+    for (const [sid, rels] of bySession) {
+      void client.notify(
+        sid,
+        `[oc-review] 用户在 VSCode 中${action}了这些文件,磁盘内容已变化(不要假设你之前的编辑仍然存在,修改前请重新读取): ${rels.join(', ')}`,
+      )
+    }
+  }
 
   // Context key so Explorer context-menu entries only appear on files that actually changed.
   controller.onDidChange((s) => {
@@ -221,7 +242,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       if (yes !== 'Revert') return
     }
     try {
-      await controller.revertFile(item, allowCoTouched)
+      const paths = await controller.revertFile(item, allowCoTouched)
+      notifyAgent(paths, '回退(revert)')
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Revert failed: ${e?.message ?? e}`)
     }
@@ -241,7 +263,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const yes = await vscode.window.showWarningMessage(msg, { modal: true }, 'Revert hunk')
     if (yes !== 'Revert hunk') return
     try {
-      await controller.revertHunk(h.item, h.index)
+      const paths = await controller.revertHunk(h.item, h.index)
+      notifyAgent(paths, '回退(revert)其中一个改动块于')
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Hunk revert failed: ${e?.message ?? e}`)
     }
@@ -270,7 +293,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     )
     if (!choice) return
     try {
-      await controller.revertRepo(r.repoRoot, choice === 'Revert + delete agent-added')
+      const paths = await controller.revertRepo(r.repoRoot, choice === 'Revert + delete agent-added')
+      notifyAgent(paths, '整仓库回退(revert)')
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Repo revert failed: ${e?.message ?? e}`)
     }
@@ -305,12 +329,39 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     }
     if (!(await confirmRevertAll())) return
     try {
-      await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'OC Review: 批量回退中…' }, () =>
-        controller.revertAll(),
+      const paths = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'OC Review: 批量回退中…' },
+        () => controller.revertAll(),
       )
+      notifyAgent(paths, '批量回退(revert)')
     } catch (e: any) {
       void vscode.window.showErrorMessage(`批量回退失败: ${e?.message ?? e}`)
     }
+  })
+
+  reg('ocReview.undoRevert', async () => {
+    const r = await controller.undoRevert()
+    if (!r) {
+      void vscode.window.showInformationMessage('OC Review: 没有可撤销的回退操作。')
+      return
+    }
+    notifyAgent(r.paths, `撤销了此前的回退(undo「${r.label}」),恢复到回退前的内容,涉及`)
+    void vscode.window.setStatusBarMessage(`OC Review: 已撤销「${r.label}」`, 3000)
+  })
+
+  reg('ocReview.redoRevert', async () => {
+    const r = await controller.redoRevert()
+    if (!r) {
+      void vscode.window.showInformationMessage('OC Review: 没有可重做的回退操作。')
+      return
+    }
+    notifyAgent(r.paths, `重做了回退(redo「${r.label}」),涉及`)
+    void vscode.window.setStatusBarMessage(`OC Review: 已重做「${r.label}」`, 3000)
+  })
+
+  reg('ocReview.clearAskThreads', async () => {
+    const yes = await vscode.window.showWarningMessage('清除所有「问 opencode」线程记录?', { modal: true }, '清除')
+    if (yes === '清除') askThreads.clearAll()
   })
 
   // Baseline history: pick one -> view cumulative diff since it, or revert workspace to it.
@@ -345,9 +396,11 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     if (action.act === 'revert') {
       if (!(await confirmRevertAll())) return
       try {
-        await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'OC Review: 回退到历史基线…' }, () =>
-          controller.revertAll(),
+        const paths = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'OC Review: 回退到历史基线…' },
+          () => controller.revertAll(),
         )
+        notifyAgent(paths, '回退(revert)到历史基线,涉及')
       } catch (e: any) {
         void vscode.window.showErrorMessage(`回退失败: ${e?.message ?? e}`)
       }

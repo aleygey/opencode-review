@@ -108,6 +108,23 @@ export class OpencodeClient {
     throw lastErr ?? new Error('prompt failed')
   }
 
+  // Context-only injection: tell the session something WITHOUT triggering a model turn.
+  // Used to keep the agent's world-model in sync after the user reverts/redoes files.
+  // Best-effort: if this server version rejects noReply we log and drop — never fall
+  // back to a normal prompt (that would start a full turn).
+  async notify(sessionID: string, text: string): Promise<boolean> {
+    try {
+      await this.json('POST', `/session/${encodeURIComponent(sessionID)}/message`, {
+        noReply: true,
+        parts: [{ type: 'text', text }],
+      })
+      return true
+    } catch (e: any) {
+      this.log.warn(`notify (noReply) failed — skipped: ${String(e?.message ?? e).slice(0, 200)}`)
+      return false
+    }
+  }
+
   async abortSession(sessionID: string): Promise<void> {
     try {
       await this.json('POST', `/session/${encodeURIComponent(sessionID)}/abort`, {})

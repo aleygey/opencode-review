@@ -4,16 +4,29 @@ import type { AgentWriteStore } from '../opencode/agentWrites.ts'
 import type { Log } from '../log.ts'
 import { normcase } from '../lib/pathcase.ts'
 
-// Quick-ask as INLINE COMMENT THREADS (VSCode Comments API) — the closest native thing
-// to "a dialog next to the cursor". No webview panel, no session picker, no model config:
-//  - the thread opens at the selection / clicked line,
+const KEY_THREADS = 'ocReview.askThreads.v1'
+const THREAD_CAP = 50
+
+type StoredThread = {
+  uri: string
+  start: number
+  end: number
+  sessionID?: string
+  selection?: string
+  comments: { author: string; body: string }[]
+}
+
+// Quick-ask as INLINE COMMENT THREADS (VSCode's built-in Comments UI — the same substrate
+// GitHub PR reviews use). No webview, no session picker, no model config:
+//  - the thread anchors to the FULL selection range (highlighted alongside the code),
 //  - the question goes to the session that last WROTE this file (fallback: last active
 //    session in this workspace; fallback: a new session),
-//  - the model is whatever that session already uses (server default),
-//  - the answer comes back as a reply in the thread (and in the opencode TUI, since it
-//    is the same session).
+//  - the model is whatever that session already uses,
+//  - threads are PERSISTED per workspace and restored on reload — an annotation record.
+// The widget chrome (collapse button, full editor width) is fixed by VSCode and not stylable.
 export class AskThreads {
   private readonly cc: vscode.CommentController
+  private readonly threads: vscode.CommentThread[] = []
   private readonly sessionByThread = new WeakMap<vscode.CommentThread, string>()
   private readonly selectionByThread = new WeakMap<vscode.CommentThread, string>()
 
@@ -21,40 +34,43 @@ export class AskThreads {
     private readonly getClient: () => OpencodeClient | undefined,
     private readonly agentWrites: AgentWriteStore,
     private readonly workspaceRoot: string,
+    private readonly memento: vscode.Memento,
     private readonly log: Log,
   ) {
     this.cc = vscode.comments.createCommentController('ocReviewAsk', 'OC Review — 问 opencode')
-    this.cc.options = { placeHolder: '问 opencode:为什么这样改?这段什么作用?…', prompt: '发送' }
+    this.cc.options = { placeHolder: '问 opencode(Enter 发送,Shift+Enter 换行)', prompt: '问 opencode' }
     // Every line of every local file can host an ask-thread (the gutter “+” affordance).
     this.cc.commentingRangeProvider = {
       provideCommentingRanges: (doc) =>
         doc.uri.scheme === 'file' ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : [],
     }
+    this.restore()
   }
 
-  // Ctrl+Alt+A: open a thread at the current selection and remember the selected code.
+  // Ctrl+Alt+A: open a thread anchored to the WHOLE current selection.
   openAtSelection(): void {
     const ed = vscode.window.activeTextEditor
     if (!ed || ed.document.uri.scheme !== 'file') {
       void vscode.window.showInformationMessage('OC Review: 先在文件里选中代码/放好光标。')
       return
     }
-    const line = ed.selection.end.line
-    const thread = this.cc.createCommentThread(ed.document.uri, new vscode.Range(line, 0, line, 0), [])
+    const sel = ed.selection
+    const range = sel.isEmpty
+      ? ed.document.lineAt(sel.active.line).range
+      : new vscode.Range(sel.start, sel.end)
+    const thread = this.cc.createCommentThread(ed.document.uri, range, [])
     thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded
     thread.canReply = true
-    thread.label = '问 opencode'
-    if (!ed.selection.isEmpty) this.selectionByThread.set(thread, ed.document.getText(ed.selection))
+    thread.label = sel.isEmpty ? '问 opencode' : `问 opencode · 选中 ${sel.end.line - sel.start.line + 1} 行`
+    if (!sel.isEmpty) this.selectionByThread.set(thread, ed.document.getText(sel))
+    this.threads.push(thread)
   }
 
   private async resolveSession(client: OpencodeClient, absFile: string): Promise<string | undefined> {
-    // 1) the session that last wrote this file
     const bySession = this.agentWrites.sessionFor(absFile)
     if (bySession) return bySession
-    // 2) the most recently observed writing session in this window
     const last = this.agentWrites.lastSession()
     if (last) return last
-    // 3) most recent server session whose directory matches this workspace
     try {
       const ws = normcase(this.workspaceRoot)
       const sessions = await client.listSessions()
@@ -65,7 +81,6 @@ export class AskThreads {
     } catch (e: any) {
       this.log.warn(`listSessions failed: ${e?.message ?? e}`)
     }
-    // 4) fresh session
     try {
       return await client.createSession('VSCode quick-ask', this.workspaceRoot)
     } catch (e: any) {
@@ -74,12 +89,25 @@ export class AskThreads {
     }
   }
 
-  // Bound to the thread's send button (receives vscode.CommentReply).
+  // Context = remembered selection, else the FULL lines the thread range spans (a thread
+  // created from the gutter “+” has no selection but may still span several lines).
+  private contextText(thread: vscode.CommentThread, doc: vscode.TextDocument): string {
+    const sel = this.selectionByThread.get(thread)
+    if (sel) return sel
+    const r = thread.range
+    if (!r) return ''
+    const startLine = Math.min(r.start.line, doc.lineCount - 1)
+    const endLine = Math.min(r.end.line, doc.lineCount - 1)
+    return doc.getText(new vscode.Range(startLine, 0, endLine, doc.lineAt(endLine).text.length))
+  }
+
+  // Bound to the thread's send button / Enter (receives vscode.CommentReply).
   async submit(reply: vscode.CommentReply): Promise<void> {
     const client = this.getClient()
     const thread = reply.thread
     const question = reply.text.trim()
     if (!question) return
+    if (!this.threads.includes(thread)) this.threads.push(thread) // gutter-created thread
     if (!client) {
       this.append(thread, 'OC Review', '未连接 opencode server — 先跑 "OC Review: Connect"。')
       return
@@ -87,9 +115,9 @@ export class AskThreads {
 
     const doc = await vscode.workspace.openTextDocument(thread.uri)
     const rel = vscode.workspace.asRelativePath(thread.uri, false)
-    const line = thread.range?.start.line ?? 0
-    const selected = this.selectionByThread.get(thread)
-    const code = selected ?? doc.lineAt(Math.min(line, doc.lineCount - 1)).text
+    const startLine = (thread.range?.start.line ?? 0) + 1
+    const endLine = (thread.range?.end.line ?? 0) + 1
+    const code = this.contextText(thread, doc)
     const lang = doc.languageId
 
     this.append(thread, '你', question)
@@ -103,7 +131,7 @@ export class AskThreads {
     this.sessionByThread.set(thread, sessionID)
 
     const prompt = [
-      `关于 \`${rel}\` 第 ${line + 1} 行附近的代码:`,
+      `关于 \`${rel}\` 第 ${startLine}${endLine !== startLine ? `-${endLine}` : ''} 行的代码:`,
       '```' + lang,
       code.length > 12000 ? code.slice(0, 12000) + '\n…(truncated)' : code,
       '```',
@@ -120,6 +148,56 @@ export class AskThreads {
       this.log.error(`quick-ask failed: ${e?.message ?? e}`)
       this.replaceLast(thread, 'opencode', `❌ 失败: ${String(e?.message ?? e).slice(0, 300)}`)
     }
+    this.persist()
+  }
+
+  // ---- persistence: threads survive window reloads (annotation record) ----
+
+  private persist(): void {
+    const stored: StoredThread[] = []
+    for (const t of this.threads) {
+      if (t.comments.length === 0) continue
+      stored.push({
+        uri: t.uri.toString(),
+        start: t.range?.start.line ?? 0,
+        end: t.range?.end.line ?? 0,
+        sessionID: this.sessionByThread.get(t),
+        selection: this.selectionByThread.get(t),
+        comments: t.comments.map((c) => ({
+          author: c.author.name,
+          body: typeof c.body === 'string' ? c.body : c.body.value,
+        })),
+      })
+    }
+    void this.memento.update(KEY_THREADS, stored.slice(-THREAD_CAP))
+  }
+
+  private restore(): void {
+    const stored = this.memento.get<StoredThread[]>(KEY_THREADS, [])
+    for (const s of stored) {
+      try {
+        const thread = this.cc.createCommentThread(
+          vscode.Uri.parse(s.uri),
+          new vscode.Range(s.start, 0, s.end, 0),
+          s.comments.map((c) => this.mkComment(c.author, c.body)),
+        )
+        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed
+        thread.canReply = true
+        thread.label = '问 opencode'
+        if (s.sessionID) this.sessionByThread.set(thread, s.sessionID)
+        if (s.selection) this.selectionByThread.set(thread, s.selection)
+        this.threads.push(thread)
+      } catch {
+        // stale entry (file gone etc.) — drop silently
+      }
+    }
+    if (stored.length) this.log.info(`restored ${stored.length} ask thread(s)`)
+  }
+
+  clearAll(): void {
+    for (const t of this.threads) t.dispose()
+    this.threads.length = 0
+    void this.memento.update(KEY_THREADS, [])
   }
 
   private mkComment(author: string, body: string): vscode.Comment {
@@ -139,6 +217,7 @@ export class AskThreads {
   }
 
   dispose(): void {
+    this.persist()
     this.cc.dispose()
   }
 }

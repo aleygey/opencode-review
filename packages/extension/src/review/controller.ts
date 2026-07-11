@@ -249,21 +249,89 @@ export class ReviewController {
     this._onDidChange.fire(this.state())
   }
 
+  // ---- undo/redo for revert operations (byte-level pre/post snapshots, in-memory) ----
+
+  private undoStack: { label: string; pre: Map<string, Buffer | null>; post: Map<string, Buffer | null> }[] = []
+  private redoStack: typeof this.undoStack = []
+
+  private captureFiles(paths: string[]): Map<string, Buffer | null> {
+    const m = new Map<string, Buffer | null>()
+    for (const abs of paths) {
+      try {
+        m.set(abs, fs.readFileSync(abs))
+      } catch {
+        m.set(abs, null) // absent
+      }
+    }
+    return m
+  }
+
+  private applyFiles(m: Map<string, Buffer | null>): void {
+    for (const [abs, buf] of m) {
+      if (buf === null) {
+        try {
+          fs.rmSync(abs, { force: true })
+        } catch {}
+      } else {
+        fs.mkdirSync(path.dirname(abs), { recursive: true })
+        fs.writeFileSync(abs, buf)
+      }
+    }
+  }
+
+  private pushUndo(label: string, pre: Map<string, Buffer | null>, post: Map<string, Buffer | null>): void {
+    this.undoStack.push({ label, pre, post })
+    if (this.undoStack.length > 20) this.undoStack.shift()
+    this.redoStack.length = 0
+  }
+
+  undoRevert(): Promise<{ label: string; paths: string[] } | undefined> {
+    return this.serialize(async () => {
+      const entry = this.undoStack.pop()
+      if (!entry) return undefined
+      this.applyFiles(entry.pre)
+      this.redoStack.push(entry)
+      await this.doRefresh()
+      return { label: entry.label, paths: [...entry.pre.keys()] }
+    })
+  }
+
+  redoRevert(): Promise<{ label: string; paths: string[] } | undefined> {
+    return this.serialize(async () => {
+      const entry = this.redoStack.pop()
+      if (!entry) return undefined
+      this.applyFiles(entry.post)
+      this.undoStack.push(entry)
+      await this.doRefresh()
+      return { label: entry.label, paths: [...entry.post.keys()] }
+    })
+  }
+
+  undoRedoDepth(): { undo: number; redo: number } {
+    return { undo: this.undoStack.length, redo: this.redoStack.length }
+  }
+
   // Reverts NEVER act on the stale classification captured at scan time: the file may have
   // been edited since. Re-classify against current disk and refuse on a fresh co-touch
   // unless the caller explicitly allowed it (review findings #2/#13).
-  revertFile(item: ReviewItem, allowCoTouched: boolean): Promise<void> {
+  // Every revert returns the affected abs paths (for agent notification) and records a
+  // byte-level pre/post snapshot for undo/redo.
+  revertFile(item: ReviewItem, allowCoTouched: boolean): Promise<string[]> {
     return this.serialize(async () => {
       const fresh = this.classify(item)
       if (fresh.coTouchedByUser && !item.coTouchedByUser && !allowCoTouched) {
         throw new Error(`'${item.path}' changed since the last scan — refresh and review the co-touched warning`)
       }
+      const paths = [item.abs]
+      const pre = this.captureFiles(paths)
       await this.engine.revertFile(fresh, this.refs, this.repos, this.shadowDir, allowCoTouched)
+      this.pushUndo(`撤销文件 ${item.path}`, pre, this.captureFiles(paths))
       await this.doRefresh()
+      return paths
     })
   }
 
-  revertHunk(item: ReviewItem, hunkIndex: number): Promise<void> {
+  revertHunk(item: ReviewItem, hunkIndex: number): Promise<string[]> {
     return this.serialize(async () => {
       const fresh = this.classify(item)
       if (fresh.coTouchedByUser || fresh.attribution !== 'agent') {
@@ -271,22 +339,30 @@ export class ReviewController {
       }
       const hunk = fresh.hunks[hunkIndex]
       if (!hunk) throw new Error(`no hunk #${hunkIndex} — the file changed since the last scan; refresh first`)
+      const paths = [item.abs]
+      const pre = this.captureFiles(paths)
       // If the on-disk content drifted from the scanned hunk, `git apply -R` fails on
       // context mismatch — a safe, atomic-per-file failure surfaced to the user.
       await this.engine.revertHunk(fresh, hunk, this.repos)
+      this.pushUndo(`撤销块 ${item.path}#${hunkIndex + 1}`, pre, this.captureFiles(paths))
       await this.doRefresh()
+      return paths
     })
   }
 
-  revertRepo(repoRoot: string, deleteAgentAdded: boolean): Promise<void> {
+  revertRepo(repoRoot: string, deleteAgentAdded: boolean): Promise<string[]> {
     return this.serialize(async () => {
       const agentAdded = deleteAgentAdded
         ? this.items
             .filter((i) => i.repoRoot === repoRoot && i.status === 'add' && this.classify(i).attribution === 'agent')
             .map((i) => i.path)
         : []
+      const paths = this.items.filter((i) => i.repoRoot === repoRoot).map((i) => i.abs)
+      const pre = this.captureFiles(paths)
       await this.engine.revertRepo(repoRoot, this.refs, this.items, this.repos, this.shadowDir, agentAdded)
+      this.pushUndo(`撤销仓库 ${path.basename(repoRoot)}`, pre, this.captureFiles(paths))
       await this.doRefresh()
+      return paths
     })
   }
 
@@ -350,9 +426,11 @@ export class ReviewController {
 
   // Batch rollback: revert EVERY repo to the current review baseline. Only agent-attributed
   // added files are deleted; unknown/user adds are kept (they reappear in the list after).
-  revertAll(): Promise<void> {
+  revertAll(): Promise<string[]> {
     return this.serialize(async () => {
       const present = this.refs.filter((r) => this.repos.some((x) => x.repoRoot === r.repoRoot))
+      const paths = this.items.map((i) => i.abs)
+      const pre = this.captureFiles(paths)
       for (const ref of present) {
         const agentAdded = this.items
           .filter((i) => i.repoRoot === ref.repoRoot && i.status === 'add' && this.classify(i).attribution === 'agent')
@@ -360,7 +438,9 @@ export class ReviewController {
         await this.engine.revertRepo(ref.repoRoot, this.refs, this.items, this.repos, this.shadowDir, agentAdded)
         this.log.info(`revertAll: ${ref.repoRoot} done (${agentAdded.length} agent-added deleted)`)
       }
+      this.pushUndo(`批量回退到 ${this.baselineId}`, pre, this.captureFiles(paths))
       await this.doRefresh()
+      return paths
     })
   }
 

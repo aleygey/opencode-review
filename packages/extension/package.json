@@ -2,7 +2,7 @@
   "name": "oc-review",
   "displayName": "OC Review — opencode change review",
   "description": "Review, navigate and roll back opencode's edits across nested git repos; inline diff marks and quick-ask about any selection.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "aleygey",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/aleygey/opencode-review" },
@@ -31,7 +31,10 @@
       { "command": "ocReview.revertHunk", "category": "OC Review", "title": "Revert Hunk", "icon": "$(discard)" },
       { "command": "ocReview.revertRepo", "category": "OC Review", "title": "Revert Repo" },
       { "command": "ocReview.revertAll", "category": "OC Review", "title": "Revert All to Baseline" },
+      { "command": "ocReview.undoRevert", "category": "OC Review", "title": "Undo Last Revert" },
+      { "command": "ocReview.redoRevert", "category": "OC Review", "title": "Redo Revert" },
       { "command": "ocReview.baselines", "category": "OC Review", "title": "Baselines…", "icon": "$(timeline-view-icon)" },
+      { "command": "ocReview.clearAskThreads", "category": "OC Review", "title": "Clear Ask Threads" },
       { "command": "ocReview.markReviewed", "category": "OC Review", "title": "Toggle Reviewed" },
       { "command": "ocReview.nextChange", "category": "OC Review", "title": "Next Change" },
       { "command": "ocReview.prevChange", "category": "OC Review", "title": "Previous Change" },
@@ -56,7 +59,9 @@
         { "command": "ocReview.refresh", "when": "view == ocReview.changes", "group": "navigation@2" },
         { "command": "ocReview.acceptAll", "when": "view == ocReview.changes", "group": "navigation@3" },
         { "command": "ocReview.baselines", "when": "view == ocReview.changes", "group": "1_more@1" },
-        { "command": "ocReview.revertAll", "when": "view == ocReview.changes", "group": "1_more@2" }
+        { "command": "ocReview.revertAll", "when": "view == ocReview.changes", "group": "1_more@2" },
+        { "command": "ocReview.undoRevert", "when": "view == ocReview.changes", "group": "1_more@3" },
+        { "command": "ocReview.redoRevert", "when": "view == ocReview.changes", "group": "1_more@4" }
       ],
       "view/item/context": [
         { "command": "ocReview.openDiff", "when": "view == ocReview.changes && viewItem == file", "group": "inline@1" },
@@ -74,7 +79,8 @@
     "keybindings": [
       { "command": "ocReview.nextChange", "key": "ctrl+alt+pagedown", "when": "editorTextFocus" },
       { "command": "ocReview.prevChange", "key": "ctrl+alt+pageup", "when": "editorTextFocus" },
-      { "command": "ocReview.quickAsk", "key": "ctrl+alt+a", "when": "editorTextFocus" }
+      { "command": "ocReview.quickAsk", "key": "ctrl+alt+a", "when": "editorTextFocus" },
+      { "command": "editor.action.submitComment", "key": "enter", "when": "commentEditorFocused && !suggestWidgetVisible" }
     ],
     "configuration": {
       "title": "OC Review",
@@ -94,6 +100,11 @@
           "items": { "type": "number" },
           "default": [4096],
           "description": "Ports probed on 127.0.0.1 during auto-discovery."
+        },
+        "ocReview.notifyAgent": {
+          "type": "boolean",
+          "default": true,
+          "description": "After a revert/undo/redo, send a context-only note into the owning opencode session so the agent re-reads changed files (no model turn is triggered)."
         },
         "ocReview.codeLens": {
           "type": "boolean",
