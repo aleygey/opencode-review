@@ -18,10 +18,20 @@ function hasGitEntry(dir: string): boolean {
   return fs.existsSync(path.join(dir, '.git'))
 }
 
-export function discoverRepos(workspaceRoot: string, opts?: { skip?: string[] }): RepoInfo[] {
+export function discoverRepos(workspaceRoot: string, opts?: { skip?: string[]; include?: string[] }): RepoInfo[] {
   const root = norm(workspaceRoot)
   const skip = new Set([...DEFAULT_SKIP, ...(opts?.skip ?? [])])
+  const includeConfigured = (opts?.include ?? []).length > 0
+  const includes = (opts?.include ?? [])
+    .map((p) => norm(path.isAbsolute(p) ? p : path.join(root, p)))
+    .filter((p) => p === root || isStrictlyUnder(p, root))
   const roots: string[] = []
+  const excluded: string[] = []
+
+  // Only descend into branches that intersect an explicit include. Ancestor repos are still
+  // discovered so a workspace-root repo can own an included subtree safely.
+  const intersectsInclude = (dir: string): boolean =>
+    !includeConfigured || includes.some((inc) => inc === dir || isStrictlyUnder(inc, dir) || isStrictlyUnder(dir, inc))
 
   const walk = (dir: string): void => {
     if (hasGitEntry(dir)) roots.push(norm(dir))
@@ -33,8 +43,12 @@ export function discoverRepos(workspaceRoot: string, opts?: { skip?: string[] })
     }
     for (const e of entries) {
       if (!e.isDirectory()) continue
-      if (skip.has(e.name)) continue
-      walk(path.join(dir, e.name))
+      const child = norm(path.join(dir, e.name))
+      if (skip.has(e.name)) {
+        if (e.name !== '.git') excluded.push(child)
+        continue
+      }
+      if (intersectsInclude(child)) walk(child)
     }
   }
   walk(root)
@@ -45,6 +59,28 @@ export function discoverRepos(workspaceRoot: string, opts?: { skip?: string[] })
       .filter((other) => other !== repoRoot && isStrictlyUnder(other, repoRoot))
       .map((other) => relPosix(repoRoot, other))
       .sort()
-    return { repoRoot, relToWorkspace: relPosix(root, repoRoot) || '.', nestedChildren }
+    const excludedPaths = excluded
+      .filter((other) => isStrictlyUnder(other, repoRoot))
+      .map((other) => relPosix(repoRoot, other))
+      .filter((rel) => !nestedChildren.some((child) => rel === child || rel.startsWith(child + '/')))
+      .sort()
+    let includedPaths: string[] | undefined
+    if (includeConfigured) {
+      if (includes.some((inc) => inc === repoRoot || isStrictlyUnder(repoRoot, inc))) includedPaths = ['.']
+      else {
+        includedPaths = includes
+          .filter((inc) => isStrictlyUnder(inc, repoRoot))
+          .map((inc) => relPosix(repoRoot, inc))
+          .sort()
+      }
+    }
+    return {
+      repoRoot,
+      relToWorkspace: relPosix(root, repoRoot) || '.',
+      nestedChildren,
+      includedPaths,
+      excludedPaths,
+      excludedDirNames: [...skip].filter((name) => name !== '.git'),
+    }
   })
 }

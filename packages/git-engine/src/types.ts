@@ -2,6 +2,14 @@ export type RepoInfo = {
   repoRoot: string // absolute, normalized, forward-slash
   relToWorkspace: string
   nestedChildren: string[] // repo-relative paths of every discovered repo strictly under this one
+  // undefined = whole repo. An array scopes the review to these repo-relative subtrees.
+  // Empty means this repo is only an ancestor/container for an included nested repo.
+  includedPaths?: string[]
+  // Concrete repo-relative directories skipped during discovery. They are load-bearing:
+  // checkpoint/collect remove them from the review index, not merely from the watcher.
+  excludedPaths?: string[]
+  // Directory names skipped at any depth (used by the extension's fast scope check).
+  excludedDirNames?: string[]
 }
 
 export type CheckpointRef = {
@@ -28,6 +36,10 @@ export type ChangeItem = {
   modeChange?: { from: string; to: string }
   hunks: Hunk[] // text hunks only
   patchHeader: string // diff --git / index / --- / +++ lines
+  additions?: number
+  deletions?: number
+  oldOid?: string
+  newOid?: string
   coTouchedByUser?: boolean // requires an AgentWriteRecord to detect; see SPEC open risk #1
 }
 

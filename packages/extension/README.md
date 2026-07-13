@@ -33,6 +33,23 @@ Review, navigate and roll back what the [opencode](https://opencode.ai) agent ch
 3. Run `OC Review: Checkpoint Now` once (afterwards auto-checkpoint handles it), let opencode work, then review in the OC Review panel.
 4. `OC Review: Diagnose` prints server/engine/repo state into the output channel — start there if anything looks off.
 
+## Large workspaces
+
+OC Review keeps a persistent per-repo review index and refreshes only paths reported by
+opencode/VSCode file events. Manual Refresh remains an authoritative full audit.
+
+For very large monorepos, scope protection explicitly:
+
+```jsonc
+{
+  "ocReview.includePaths": ["src", "packages/app"],
+  "ocReview.excludeDirs": ["generated", "third_party_cache"]
+}
+```
+
+Paths outside this scope are not checkpointed, reviewed, or revertible. Only exclude content
+that the agent must never modify. Built-in generated/cache directories are excluded as well.
+
 ## Safety model (honest edition)
 
 - Reverts restore **byte-exact** baseline content and never run `git clean` / touch your real index; nested repos are their own rollback units.

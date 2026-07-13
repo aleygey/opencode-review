@@ -7,9 +7,25 @@ import type { ReviewController } from './controller.ts'
 export class ChangedFileDecorations implements vscode.FileDecorationProvider {
   private readonly _onDidChange = new vscode.EventEmitter<vscode.Uri[] | undefined>()
   readonly onDidChangeFileDecorations = this._onDidChange.event
+  private previous = new Map<string, string>()
 
   constructor(private readonly controller: ReviewController) {
-    controller.onDidChange(() => this._onDidChange.fire(undefined)) // refresh all
+    this.previous = this.snapshot()
+    controller.onDidChange(() => {
+      const next = this.snapshot()
+      const changed: vscode.Uri[] = []
+      for (const key of new Set([...this.previous.keys(), ...next.keys()])) {
+        if (this.previous.get(key) !== next.get(key)) changed.push(vscode.Uri.file(key))
+      }
+      this.previous = next
+      if (changed.length > 0) this._onDidChange.fire(changed)
+    })
+  }
+
+  private snapshot(): Map<string, string> {
+    return new Map(
+      this.controller.state().items.map((i) => [i.abs, `${i.status}\0${i.attribution}\0${i.reviewed}`]),
+    )
   }
 
   provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {

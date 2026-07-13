@@ -56,7 +56,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 
   // ---- UI ----
   const tree = new ChangesTree(controller)
-  ctx.subscriptions.push(vscode.window.createTreeView('ocReview.changes', { treeDataProvider: tree, showCollapseAll: true }))
+  const treeView = vscode.window.createTreeView('ocReview.changes', { treeDataProvider: tree, showCollapseAll: true })
+  ctx.subscriptions.push(treeView)
   const baselineDocs = new BaselineDocProvider(controller)
   ctx.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider(SCHEME, baselineDocs))
   const marks = new InlineMarks(controller)
@@ -194,7 +195,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         return
       }
       if (evt.type === 'file.edited' || evt.type === 'file.watcher.updated') {
-        controller.scheduleRefresh(1500)
+        // Live updates are useful only while the view is visible; session.idle always flushes.
+        if (treeView.visible) controller.scheduleRefresh(1200)
         return
       }
       // Permission prompts (only fire if the user kept some permission on "ask").
@@ -625,29 +627,43 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   // with its own port), no SSE events arrive. A workspace watcher keeps the change list
   // fresh anyway — degraded mode is then: manual "Checkpoint Now" before the task,
   // automatic refresh after (attribution shows "unverified", which is accurate).
-  const watcher = vscode.workspace.createFileSystemWatcher('**/*')
+  const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(wsFolder, '**/*'))
   // Heavy/generated dirs never carry reviewable source — ignore their churn so the watcher
   // doesn't wake a refresh for every build artifact.
   const IGNORE_SEG = new Set([
     '.git', 'node_modules', 'dist', 'build', 'out', 'target', '.venv', 'venv', '__pycache__',
     '.cache', '.next', '.turbo', 'vendor', 'coverage', '.oc-review',
   ])
-  const extraIgnore: string[] = cfg().get<string[]>('excludeDirs', [])
+  const extraIgnore = () => cfg().get<string[]>('excludeDirs', [])
   const onFs = (uri: vscode.Uri, kind: 'change' | 'create' | 'delete') => {
     if (uri.scheme !== 'file') return
     if (!controller.hasBaseline()) return
     const p = uri.fsPath
     const segs = p.split(/[\\/]/)
-    if (segs.some((s) => IGNORE_SEG.has(s) || extraIgnore.includes(s))) return
-    controller.markPathDirty(p)
-    // create/delete may change the repo set — mark for a re-discover on the next refresh.
-    if (kind !== 'change' && segs[segs.length - 1] === '.git') controller.markPathDirty(p)
+    const gitEntryChanged = kind !== 'change' && segs[segs.length - 1] === '.git'
+    if (gitEntryChanged) {
+      controller.markPathDirty(p)
+      controller.scheduleRefresh(300)
+      return
+    }
+    const configuredIgnore = extraIgnore()
+    if (segs.some((s) => IGNORE_SEG.has(s) || configuredIgnore.includes(s))) return
+    if (!controller.markPathDirty(p)) return
     controller.scheduleRefresh(1200)
   }
   watcher.onDidChange((u) => onFs(u, 'change'))
   watcher.onDidCreate((u) => onFs(u, 'create'))
   watcher.onDidDelete((u) => onFs(u, 'delete'))
   ctx.subscriptions.push(watcher)
+
+  // Scope changes invalidate both repo discovery and the persistent review snapshot.
+  ctx.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('ocReview.excludeDirs') || e.affectsConfiguration('ocReview.includePaths')) {
+        void controller.refresh('full')
+      }
+    }),
+  )
 
   // ---- startup ----
   renderStatus()

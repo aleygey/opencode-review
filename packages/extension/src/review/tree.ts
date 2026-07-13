@@ -17,6 +17,12 @@ export type Node =
   | { kind: 'baseline'; id: string; at: number; note?: string; repos: number }
 
 function plusMinus(item: ReviewItem): string {
+  if (item.isBinary) return 'bin'
+  if (item.additions !== undefined || item.deletions !== undefined) {
+    const a = item.additions ?? 0
+    const d = item.deletions ?? 0
+    return `${a ? `+${a}` : ''}${d ? ` -${d}` : ''}`.trim() || (item.status === 'del' ? 'deleted' : '')
+  }
   let a = 0
   let d = 0
   for (const h of item.hunks) {
@@ -25,12 +31,12 @@ function plusMinus(item: ReviewItem): string {
       else if (line.startsWith('-')) d++
     }
   }
-  if (item.isBinary) return 'bin'
   return `${a ? `+${a}` : ''}${d ? ` -${d}` : ''}`.trim() || (item.status === 'del' ? 'deleted' : '')
 }
 
 function buildDirIndex(entries: { item: ReviewItem; wsPath: string }[]): DirIndex {
   const idx: DirIndex = new Map()
+  const dirSeen = new Map<string, Set<string>>()
   const ensure = (d: string) => {
     let e = idx.get(d)
     if (!e) {
@@ -46,7 +52,12 @@ function buildDirIndex(entries: { item: ReviewItem; wsPath: string }[]): DirInde
     for (let i = 0; i < parts.length - 1; i++) {
       const child = dir ? `${dir}/${parts[i]}` : parts[i]
       const parent = ensure(dir)
-      if (!parent.dirs.includes(child)) parent.dirs.push(child)
+      const seen = dirSeen.get(dir) ?? new Set<string>()
+      if (!seen.has(child)) {
+        seen.add(child)
+        dirSeen.set(dir, seen)
+        parent.dirs.push(child)
+      }
       ensure(child)
       dir = child
     }
@@ -63,11 +74,14 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>()
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event
   private state: ReviewState
+  private repoRel = new Map<string, string>()
 
   constructor(private readonly controller: ReviewController) {
     this.state = controller.state()
+    this.repoRel = new Map(this.state.repos.map((r) => [r.repoRoot, r.relToWorkspace]))
     controller.onDidChange((s) => {
       this.state = s
+      this.repoRel = new Map(s.repos.map((r) => [r.repoRoot, r.relToWorkspace]))
       this._onDidChangeTreeData.fire()
     })
   }
@@ -82,7 +96,7 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
 
   // workspace-relative path of an item = its repo's rel prefix + repo-relative path
   private wsPathOf(item: ReviewItem): string {
-    const rel = this.state.repos.find((r) => r.repoRoot === item.repoRoot)?.relToWorkspace ?? ''
+    const rel = this.repoRel.get(item.repoRoot) ?? ''
     return !rel || rel === '.' ? item.path : `${rel}/${item.path}`
   }
 

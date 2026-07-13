@@ -162,6 +162,75 @@ test('T26: collect reuses a warm index across refreshes and stays authoritative'
   assert.deepEqual(items, [], 'worktree back at baseline → clean, no phantom entries from the warm index')
 })
 
+test('T27: path-scoped collect updates and returns only requested paths', (t) => {
+  const { root, shadow } = mkWorkspace(t)
+  initRepo(root)
+  fs.writeFileSync(path.join(root, 'a.txt'), 'a\n')
+  fs.writeFileSync(path.join(root, 'b.txt'), 'b\n')
+  commitAll(root)
+  const repos = discoverRepos(root)
+  const cps = checkpoint(repos, { shadowDir: shadow, id: ID })
+  const repoRoot = repos[0].repoRoot
+
+  fs.writeFileSync(path.join(root, 'a.txt'), 'a2\n')
+  fs.writeFileSync(path.join(root, 'b.txt'), 'b2\n')
+  let items = collectChanges(cps, repos, { shadowDir: shadow, pathsByRepo: new Map([[repoRoot, ['a.txt']]]) })
+  assert.deepEqual(items.map((i) => i.path), ['a.txt'], 'first fast pass only returns a.txt')
+  items = collectChanges(cps, repos, { shadowDir: shadow, pathsByRepo: new Map([[repoRoot, ['b.txt']]]) })
+  assert.deepEqual(items.map((i) => i.path), ['b.txt'], 'second fast pass only returns b.txt')
+  assert.deepEqual(collectChanges(cps, repos, { shadowDir: shadow }).map((i) => i.path), ['a.txt', 'b.txt'])
+
+  fs.writeFileSync(path.join(root, 'a.txt'), 'a\n')
+  items = collectChanges(cps, repos, { shadowDir: shadow, pathsByRepo: new Map([[repoRoot, ['a.txt']]]) })
+  assert.deepEqual(items, [], 'a.txt returning to baseline removes its partial row')
+  assert.deepEqual(collectChanges(cps, repos, { shadowDir: shadow }).map((i) => i.path), ['b.txt'])
+})
+
+test('T28: checkpoint is a root snapshot and configured scope is load-bearing', (t) => {
+  const { root, shadow } = mkWorkspace(t)
+  initRepo(root)
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true })
+  fs.mkdirSync(path.join(root, 'dist'), { recursive: true })
+  fs.mkdirSync(path.join(root, 'docs'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'src', 'keep.ts'), 'keep\n')
+  fs.writeFileSync(path.join(root, 'dist', 'bundle.js'), 'large generated\n')
+  fs.writeFileSync(path.join(root, 'docs', 'outside.md'), 'outside include\n')
+  commitAll(root)
+  const repos = discoverRepos(root, { include: ['src'] })
+  const cps = checkpoint(repos, { shadowDir: shadow, id: ID })
+  const cp = cps.get(repos[0].repoRoot)!
+  const parents = git(['rev-list', '--parents', '-n', '1', cp.commit], root).trim().split(/\s+/)
+  assert.equal(parents.length, 1, 'checkpoint commit has no HEAD parent/history closure')
+  const files = git(['ls-tree', '-r', '--name-only', cp.commit], root).trim().split('\n').filter(Boolean)
+  assert.deepEqual(files, ['src/keep.ts'], 'include/exclude scope changes the actual checkpoint tree')
+})
+
+test('T29: batched path diff maps hunks for spaces/unicode and directory deletion', (t) => {
+  const { root, shadow } = mkWorkspace(t)
+  initRepo(root)
+  fs.mkdirSync(path.join(root, 'dir'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'dir', 'a space.txt'), 'alpha\n')
+  fs.writeFileSync(path.join(root, 'dir', '中文.txt'), 'beta\n')
+  commitAll(root)
+  const repos = discoverRepos(root)
+  const cps = checkpoint(repos, { shadowDir: shadow, id: ID })
+  const repoRoot = repos[0].repoRoot
+  fs.writeFileSync(path.join(root, 'dir', 'a space.txt'), 'ALPHA\n')
+  fs.writeFileSync(path.join(root, 'dir', '中文.txt'), 'BETA\n')
+  let items = collectChanges(cps, repos, { shadowDir: shadow, pathsByRepo: new Map([[repoRoot, ['dir']]]) })
+  assert.equal(items.length, 2)
+  assert.ok(items.find((i) => i.path === 'dir/a space.txt')?.hunks.some((h) => h.body.includes('ALPHA')))
+  assert.ok(items.find((i) => i.path === 'dir/中文.txt')?.hunks.some((h) => h.body.includes('BETA')))
+
+  removeFileSync(path.join(root, 'dir', 'a space.txt'))
+  removeFileSync(path.join(root, 'dir', '中文.txt'))
+  items = collectChanges(cps, repos, { shadowDir: shadow, pathsByRepo: new Map([[repoRoot, ['dir']]]) })
+  assert.deepEqual(items.map((i) => [i.path, i.status]), [
+    ['dir/a space.txt', 'del'],
+    ['dir/中文.txt', 'del'],
+  ])
+})
+
 test('T14: revertFile restores byte-exact content (no CRLF corruption under autocrlf=true)', (t) => {
   const { root, shadow } = mkWorkspace(t)
   initRepo(root, true)

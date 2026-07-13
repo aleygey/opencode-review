@@ -3,7 +3,14 @@ import * as cp from 'node:child_process'
 import * as path from 'node:path'
 import type { Log } from './log.ts'
 
-export type RepoInfo = { repoRoot: string; relToWorkspace: string; nestedChildren: string[] }
+export type RepoInfo = {
+  repoRoot: string
+  relToWorkspace: string
+  nestedChildren: string[]
+  includedPaths?: string[]
+  excludedPaths?: string[]
+  excludedDirNames?: string[]
+}
 export type CheckpointRef = { repoRoot: string; commit: string; ref: string; hadHead: boolean }
 export type Hunk = { header: string; body: string; agentAttributed: boolean }
 export type ChangeStatus = 'add' | 'mod' | 'del' | 'rename'
@@ -16,6 +23,10 @@ export type ChangeItem = {
   modeChange?: { from: string; to: string }
   hunks: Hunk[]
   patchHeader: string
+  additions?: number
+  deletions?: number
+  oldOid?: string
+  newOid?: string
   coTouchedByUser?: boolean
 }
 export type BlobContent = { exists: boolean; binary?: boolean; text?: string }
@@ -82,14 +93,19 @@ export class EngineClient {
   ping(): Promise<string> {
     return this.call('ping', {})
   }
-  discover(workspaceRoot: string, skip?: string[]): Promise<RepoInfo[]> {
-    return this.call('discover', { workspaceRoot, skip })
+  discover(workspaceRoot: string, skip?: string[], include?: string[]): Promise<RepoInfo[]> {
+    return this.call('discover', { workspaceRoot, skip, include })
   }
   checkpoint(repos: RepoInfo[], shadowDir: string, id: string): Promise<CheckpointRef[]> {
     return this.call('checkpoint', { repos, shadowDir, id })
   }
-  collect(refs: CheckpointRef[], repos: RepoInfo[], shadowDir: string): Promise<ChangeItem[]> {
-    return this.call('collect', { refs, repos, shadowDir })
+  collect(
+    refs: CheckpointRef[],
+    repos: RepoInfo[],
+    shadowDir: string,
+    pathsByRepo?: { repoRoot: string; paths?: string[] }[],
+  ): Promise<ChangeItem[]> {
+    return this.call('collect', { refs, repos, shadowDir, pathsByRepo })
   }
   revertFile(item: ChangeItem, refs: CheckpointRef[], repos: RepoInfo[], shadowDir: string, allowCoTouched: boolean): Promise<void> {
     return this.call('revertFile', { item, refs, repos, shadowDir, allowCoTouched })

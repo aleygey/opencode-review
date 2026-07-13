@@ -11,12 +11,13 @@ const MAX_BUFFER = 256 * 1024 * 1024
 export const NO_CRLF = ['-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false']
 export const ADD_QUIET = ['-c', 'advice.addEmbeddedRepo=false']
 
-export function runGit(args: string[], cwd: string, env?: GitEnv): GitRun {
+export function runGit(args: string[], cwd: string, env?: GitEnv, input?: Buffer | string): GitRun {
   const r = spawnSync('git', args, {
     cwd,
     env: env ? { ...process.env, ...env } : process.env,
     maxBuffer: MAX_BUFFER,
     windowsHide: true,
+    input,
   })
   if (r.error) throw r.error
   return {
