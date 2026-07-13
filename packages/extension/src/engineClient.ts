@@ -82,8 +82,8 @@ export class EngineClient {
   ping(): Promise<string> {
     return this.call('ping', {})
   }
-  discover(workspaceRoot: string): Promise<RepoInfo[]> {
-    return this.call('discover', { workspaceRoot })
+  discover(workspaceRoot: string, skip?: string[]): Promise<RepoInfo[]> {
+    return this.call('discover', { workspaceRoot, skip })
   }
   checkpoint(repos: RepoInfo[], shadowDir: string, id: string): Promise<CheckpointRef[]> {
     return this.call('checkpoint', { repos, shadowDir, id })

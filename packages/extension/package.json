@@ -2,7 +2,7 @@
   "name": "oc-review",
   "displayName": "OC Review — opencode change review",
   "description": "Review, navigate and roll back opencode's edits across nested git repos; inline diff marks and quick-ask about any selection.",
-  "version": "0.9.3",
+  "version": "0.10.0",
   "publisher": "aleygey",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/aleygey/opencode-review" },
@@ -113,6 +113,12 @@
           "type": "boolean",
           "default": true,
           "description": "Show one-click revert CodeLens above changed hunks in the editor."
+        },
+        "ocReview.excludeDirs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra directory NAMES to skip when discovering repos and watching for changes (on top of the built-in .git/node_modules/build/dist/… list). Speeds up scanning on a huge workspace. WARNING: opencode edits inside an excluded dir won't be reviewable — only exclude generated/vendored dirs the agent never touches."
         },
         "ocReview.autoCheckpoint": {
           "type": "string",

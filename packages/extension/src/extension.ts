@@ -147,9 +147,18 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   // ---- opencode connection + event wiring ----
   const turnSeen = new Set<string>() // sessionIDs whose turn-start we already checkpointed
 
+  const toAbs = (p: string) => (path.isAbsolute(p) ? p : path.join(workspaceRoot, p))
+
   const wireEvents = (c: OpencodeClient) => {
     c.onEvent((evt) => {
       agentWrites.handleEvent(evt)
+      // Mark the owning repo dirty so the next refresh only re-scans THAT repo (scoped).
+      if (evt.type === 'message.part.updated') {
+        const te = extractToolEvent(evt.props)
+        if (te?.filePath) controller.markPathDirty(toAbs(te.filePath))
+      } else if (evt.type === 'file.edited') {
+        if (typeof evt.props?.file === 'string') controller.markPathDirty(toAbs(evt.props.file))
+      }
 
       // Turn start: session goes busy, or the first file-tool activity appears.
       if (evt.type === 'session.status') {
@@ -270,7 +279,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     tree.refresh()
   })
 
-  reg('ocReview.refresh', () => controller.refresh())
+  reg('ocReview.refresh', () => controller.refresh('full')) // manual refresh = authoritative full scan
 
   reg('ocReview.acceptAll', async () => {
     const n = controller.state().items.length
@@ -617,17 +626,27 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   // fresh anyway — degraded mode is then: manual "Checkpoint Now" before the task,
   // automatic refresh after (attribution shows "unverified", which is accurate).
   const watcher = vscode.workspace.createFileSystemWatcher('**/*')
-  const onFs = (uri: vscode.Uri) => {
+  // Heavy/generated dirs never carry reviewable source — ignore their churn so the watcher
+  // doesn't wake a refresh for every build artifact.
+  const IGNORE_SEG = new Set([
+    '.git', 'node_modules', 'dist', 'build', 'out', 'target', '.venv', 'venv', '__pycache__',
+    '.cache', '.next', '.turbo', 'vendor', 'coverage', '.oc-review',
+  ])
+  const extraIgnore: string[] = cfg().get<string[]>('excludeDirs', [])
+  const onFs = (uri: vscode.Uri, kind: 'change' | 'create' | 'delete') => {
     if (uri.scheme !== 'file') return
-    const p = uri.fsPath
-    if (p.includes(`${path.sep}.git${path.sep}`) || p.endsWith(`${path.sep}.git`)) return
-    if (p.includes(`${path.sep}node_modules${path.sep}`)) return
     if (!controller.hasBaseline()) return
-    controller.scheduleRefresh(2000)
+    const p = uri.fsPath
+    const segs = p.split(/[\\/]/)
+    if (segs.some((s) => IGNORE_SEG.has(s) || extraIgnore.includes(s))) return
+    controller.markPathDirty(p)
+    // create/delete may change the repo set — mark for a re-discover on the next refresh.
+    if (kind !== 'change' && segs[segs.length - 1] === '.git') controller.markPathDirty(p)
+    controller.scheduleRefresh(1200)
   }
-  watcher.onDidChange(onFs)
-  watcher.onDidCreate(onFs)
-  watcher.onDidDelete(onFs)
+  watcher.onDidChange((u) => onFs(u, 'change'))
+  watcher.onDidCreate((u) => onFs(u, 'create'))
+  watcher.onDidDelete((u) => onFs(u, 'delete'))
   ctx.subscriptions.push(watcher)
 
   // ---- startup ----

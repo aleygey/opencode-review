@@ -25,7 +25,7 @@ function handle(op: string, a: any): any {
     case 'ping':
       return 'pong'
     case 'discover':
-      return discoverRepos(a.workspaceRoot) satisfies RepoInfo[]
+      return discoverRepos(a.workspaceRoot, { skip: a.skip }) satisfies RepoInfo[]
     case 'checkpoint': {
       const m = checkpoint(a.repos, { shadowDir: a.shadowDir, id: a.id })
       return [...m.values()]
