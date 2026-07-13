@@ -1,6 +1,7 @@
 // Engine worker — forked by the extension so the engine's synchronous git calls
 // (spawnSync) never block the extension host. Speaks JSON over process IPC.
 import * as path from 'node:path'
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads'
 import {
   discoverRepos,
   checkpoint,
@@ -16,22 +17,54 @@ import { gitText, gitBuffer, gitOk, runGit as runGitAllowFail } from '../../git-
 type Req = { id: number; op: string; args: any }
 type Res = { id: number; ok: boolean; result?: any; error?: string }
 
+type CheckpointWorkerData = { kind: 'checkpoint'; repo: RepoInfo; shadowDir: string; id: string }
+
 function cpMap(refs: CheckpointRef[]): Map<string, CheckpointRef> {
   return new Map(refs.map((r) => [r.repoRoot, r]))
 }
 
-function handle(op: string, a: any): any {
+function checkpointInWorker(repo: RepoInfo, shadowDir: string, id: string): Promise<CheckpointRef> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(__filename, { workerData: { kind: 'checkpoint', repo, shadowDir, id } satisfies CheckpointWorkerData })
+    worker.once('message', (msg: any) => msg?.ok ? resolve(msg.ref) : reject(new Error(msg?.error ?? 'checkpoint worker failed')))
+    worker.once('error', reject)
+    worker.once('exit', (code) => { if (code !== 0) reject(new Error(`checkpoint worker exited (${code})`)) })
+  })
+}
+
+async function checkpointParallel(repos: RepoInfo[], shadowDir: string, id: string): Promise<CheckpointRef[]> {
+  const out = new Array<CheckpointRef>(repos.length)
+  let next = 0
+  const run = async () => {
+    for (;;) {
+      const i = next++
+      if (i >= repos.length) return
+      out[i] = await checkpointInWorker(repos[i], shadowDir, id)
+    }
+  }
+  // Two concurrent repos is a good SSD/remote default without turning a baseline into an IO storm.
+  await Promise.all(Array.from({ length: Math.min(2, repos.length) }, run))
+  return out
+}
+
+async function handle(op: string, a: any): Promise<any> {
   switch (op) {
     case 'ping':
       return 'pong'
     case 'discover':
-      return discoverRepos(a.workspaceRoot, { skip: a.skip }) satisfies RepoInfo[]
+      return discoverRepos(a.workspaceRoot, { skip: a.skip, include: a.include }) satisfies RepoInfo[]
     case 'checkpoint': {
-      const m = checkpoint(a.repos, { shadowDir: a.shadowDir, id: a.id })
-      return [...m.values()]
+      if (a.repos.length <= 1) {
+        const m = checkpoint(a.repos, { shadowDir: a.shadowDir, id: a.id })
+        return [...m.values()]
+      }
+      return checkpointParallel(a.repos, a.shadowDir, a.id)
     }
     case 'collect': {
-      return collectChanges(cpMap(a.refs), a.repos, { shadowDir: a.shadowDir }) satisfies ChangeItem[]
+      const pathsByRepo = Array.isArray(a.pathsByRepo)
+        ? new Map<string, string[] | undefined>(a.pathsByRepo.map((x: any) => [String(x.repoRoot), Array.isArray(x.paths) ? x.paths.map(String) : undefined]))
+        : undefined
+      return collectChanges(cpMap(a.refs), a.repos, { shadowDir: a.shadowDir, pathsByRepo }) satisfies ChangeItem[]
     }
     case 'revertFile':
       revertFile(a.item, cpMap(a.refs), a.repos, { shadowDir: a.shadowDir, allowCoTouched: a.allowCoTouched })
@@ -98,18 +131,32 @@ function handle(op: string, a: any): any {
   }
 }
 
-process.on('message', (msg: Req) => {
-  const res: Res = { id: msg.id, ok: true }
+if (!isMainThread) {
+  const data = workerData as CheckpointWorkerData
   try {
-    res.result = handle(msg.op, msg.args ?? {})
+    if (data?.kind !== 'checkpoint') throw new Error('unknown engine worker task')
+    const ref = [...checkpoint([data.repo], { shadowDir: data.shadowDir, id: data.id }).values()][0]
+    parentPort?.postMessage({ ok: true, ref })
   } catch (e: any) {
-    res.ok = false
-    res.error = e?.stack || String(e?.message ?? e)
+    parentPort?.postMessage({ ok: false, error: e?.stack || String(e?.message ?? e) })
   }
-  process.send?.(res)
-})
+  parentPort?.close()
+} else {
+  process.on('message', (msg: Req) => {
+    void (async () => {
+      const res: Res = { id: msg.id, ok: true }
+      try {
+        res.result = await handle(msg.op, msg.args ?? {})
+      } catch (e: any) {
+        res.ok = false
+        res.error = e?.stack || String(e?.message ?? e)
+      }
+      process.send?.(res)
+    })()
+  })
 
-// Keep worker alive; exit with parent.
-process.on('disconnect', () => process.exit(0))
+  // Keep worker alive; exit with parent.
+  process.on('disconnect', () => process.exit(0))
+}
 // Windows path sanity: engine normalizes to forward slashes internally.
 void path

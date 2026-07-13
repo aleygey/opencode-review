@@ -46,6 +46,7 @@ export class ReviewController {
   private missingRepos: { repoRoot: string; rel: string }[] = []
   private newRepos: { repoRoot: string; rel: string; agentCreated: boolean }[] = []
   private reviewed = new Set<string>() // `${repoRoot}\0${path}`
+  private itemIndex = new Map<string, ReviewItem>()
   private refreshTimer: NodeJS.Timeout | undefined
   private refreshFirstAt: number | undefined // debounce max-wait anchor
 
@@ -53,9 +54,12 @@ export class ReviewController {
   // Only re-collect the repos whose files actually changed; skip a refresh entirely when
   // nothing relevant changed. This turns a refresh from O(all repos) into O(changed repos)
   // — the main scan-latency win on a large workspace.
-  private dirtyRepos = new Set<string>() // repoRoots touched since the last collect
+  private dirtyPaths = new Map<string, Set<string>>() // repoRoot -> repo-relative paths/prefixes
+  private dirtyFullRepos = new Set<string>() // ignore/scope semantics changed; reconcile whole repo
   private needsDiscover = true // re-run discoverRepos (repo set may have changed)
   private haveCollected = false // we hold a valid items snapshot to merge onto
+  private refreshRequested: 'auto' | 'full' | undefined
+  private refreshRunning: Promise<boolean> | undefined
 
   // All mutating engine operations run through one promise chain: an explicit
   // "Checkpoint Now" queues behind an in-flight collect instead of silently no-oping.
@@ -107,8 +111,7 @@ export class ReviewController {
   }
 
   itemFor(abs: string): ReviewItem | undefined {
-    const n = normcase(abs)
-    return this.items.find((i) => normcase(i.abs) === n)
+    return this.itemIndex.get(normcase(abs))
   }
 
   getRefs(): CheckpointRef[] {
@@ -120,8 +123,14 @@ export class ReviewController {
 
   async ensureRepos(): Promise<RepoInfo[]> {
     const skip = vscode.workspace.getConfiguration('ocReview').get<string[]>('excludeDirs', [])
-    this.repos = await this.engine.discover(this.workspaceRoot, skip)
+    const include = vscode.workspace.getConfiguration('ocReview').get<string[]>('includePaths', [])
+    this.repos = await this.engine.discover(this.workspaceRoot, skip, include)
     return this.repos
+  }
+
+  private setItems(items: ReviewItem[]): void {
+    this.items = items
+    this.itemIndex = new Map(items.map((item) => [normcase(item.abs), item]))
   }
 
   // New baseline = checkpoint every repo now; clears review marks.
@@ -134,9 +143,16 @@ export class ReviewController {
     // into the new epoch — clearing afterwards wiped mid-checkpoint captures.
     this.agentWrites.clear()
     await this.ensureRepos()
+    this.needsDiscover = false
+    // Start a new dirty epoch immediately before snapshotting. Events that arrive while the
+    // checkpoint runs survive and are reconciled path-by-path against the new baseline.
+    this.dirtyPaths.clear()
+    this.dirtyFullRepos.clear()
     const id = `vs-${Date.now()}`
+    const checkpointStarted = Date.now()
     this.log.info(`checkpoint (${reason}) id=${id} repos=${this.repos.length}`)
     const refs = await this.engine.checkpoint(this.repos, this.shadowDir, id)
+    this.log.info(`checkpoint completed in ${Date.now() - checkpointStarted}ms`)
     // Retire the current baseline into HISTORY — the shadow refs are permanent, so any
     // historical baseline can later be re-viewed or reverted to (batch rollback).
     const prev = this.memento.get<StoredBaseline>(KEY_BASELINE)
@@ -150,10 +166,12 @@ export class ReviewController {
     this.baselineNote = note
     this.reviewed.clear()
     await this.memento.update(KEY_BASELINE, { id, at: this.baselineAt, refs, note } satisfies StoredBaseline)
-    this.items = []
+    this.setItems([])
     this.missingRepos = []
-    this.dirtyRepos.clear()
-    this.haveCollected = false // next refresh must be a full collect to populate items
+    this.newRepos = []
+    // checkpoint deliberately leaves its authoritative index for collect, so no second cold
+    // scan is needed. Only paths written during checkpoint remain in dirtyPaths above.
+    this.haveCollected = true
     this._onDidChange.fire(this.state())
   }
 
@@ -168,6 +186,7 @@ export class ReviewController {
     if (this.refreshTimer) {
       clearTimeout(this.refreshTimer)
       this.refreshTimer = undefined
+      this.refreshFirstAt = undefined
     }
     // Turn-start must be authoritative → FULL collect, never a scoped/skipped one.
     const authoritative = await this.refresh('full')
@@ -178,14 +197,47 @@ export class ReviewController {
     }
   }
 
-  // Map a changed path to its owning repo (deepest containing repoRoot). Records the repo as
-  // dirty; a path outside every known repo (or a `.git` touch) forces a re-discover next time.
-  markPathDirty(abs: string): void {
+  // Map a changed path to its deepest owning repo and retain the exact repo-relative path.
+  // Returns false for paths intentionally outside the configured review scope.
+  markPathDirty(abs: string): boolean {
     const base = path.basename(abs)
-    if (base === '.git' || abs.split(/[\\/]/).includes('.git')) this.needsDiscover = true
+    if (base === '.git' || abs.split(/[\\/]/).includes('.git')) {
+      this.needsDiscover = true
+      return true
+    }
     const owner = this.ownerRepo(abs)
-    if (owner) this.dirtyRepos.add(owner)
-    else this.needsDiscover = true // outside all known repos → a new dir/repo may have appeared
+    if (!owner) {
+      this.needsDiscover = true // outside all known repos → a new dir/repo may have appeared
+      return true
+    }
+    const repo = this.repos.find((r) => r.repoRoot === owner)!
+    const rel = path.relative(owner, abs).split(path.sep).join('/') || '.'
+    if (!this.pathInScope(repo, rel)) return false
+    if (base === '.gitignore' || rel === '.git/info/exclude') {
+      this.dirtyFullRepos.add(owner) // one ignore edit can change visibility of many paths
+    } else {
+      const set = this.dirtyPaths.get(owner) ?? new Set<string>()
+      set.add(rel)
+      this.dirtyPaths.set(owner, set)
+    }
+    return true
+  }
+
+  private pathInScope(repo: RepoInfo, rel: string): boolean {
+    const clean = rel.split(path.sep).join('/').replace(/^\.\//, '')
+    const under = (p: string) => clean === p || clean.startsWith(p + '/')
+    if (repo.nestedChildren.some(under)) return false
+    if ((repo.excludedPaths ?? []).some(under)) return false
+    const names = new Set(repo.excludedDirNames ?? [])
+    if (clean.split('/').some((s) => names.has(s))) return false
+    return repo.includedPaths === undefined || repo.includedPaths.some((p) =>
+      p === '.' || under(p) || clean === '.' || p.startsWith(clean.replace(/\/$/, '') + '/'),
+    )
+  }
+
+  private markRepoFull(repoRoot: string): void {
+    this.dirtyFullRepos.add(repoRoot)
+    this.dirtyPaths.delete(repoRoot)
   }
 
   private ownerRepo(abs: string): string | undefined {
@@ -199,7 +251,7 @@ export class ReviewController {
     return best
   }
 
-  private static readonly REFRESH_MAX_WAIT = 1500 // never delay a pending refresh beyond this
+  private static readonly REFRESH_MAX_WAIT = 5000 // live preview cap; session.idle flushes sooner
 
   scheduleRefresh(delayMs = 800): void {
     const now = Date.now()
@@ -219,7 +271,24 @@ export class ReviewController {
   // Returns true when the collect ran to completion (state is authoritative).
   // 'auto' = scoped when possible (only dirty repos), 'full' = discover + collect everything.
   refresh(mode: 'auto' | 'full' = 'auto'): Promise<boolean> {
-    return this.serialize(() => this.doRefresh(mode))
+    // Coalesce all refresh requests into one drain loop. A slow repository can therefore
+    // never accumulate an unbounded chain of stale scans every REFRESH_MAX_WAIT milliseconds.
+    if (mode === 'full' || this.refreshRequested === undefined) this.refreshRequested = mode
+    if (this.refreshRunning) return this.refreshRunning
+    this.refreshRunning = this.serialize(async () => {
+      let ok = true
+      while (this.refreshRequested) {
+        const next = this.refreshRequested
+        this.refreshRequested = undefined
+        ok = (await this.doRefresh(next)) && ok
+      }
+      return ok
+    }).finally(() => {
+      this.refreshRunning = undefined
+      // Covers the narrow race where an event arrives after the drain loop's final check.
+      if (this.refreshRequested) void this.refresh()
+    })
+    return this.refreshRunning
   }
 
   private async doRefresh(mode: 'auto' | 'full'): Promise<boolean> {
@@ -231,14 +300,22 @@ export class ReviewController {
       if (mode === 'full' || this.needsDiscover || !this.haveCollected) return await this.fullCollect()
       return await this.scopedCollect()
     } catch (e: any) {
+      if (mode === 'full') {
+        this.needsDiscover = true
+        this.haveCollected = false
+      }
       this.log.error(`refresh failed: ${e?.message ?? e}`)
       return false
     }
   }
 
   private async fullCollect(): Promise<boolean> {
-    await this.ensureRepos()
+    const started = Date.now()
+    // Clear BEFORE the scan. Events arriving during Git work remain dirty for the next pass.
+    this.dirtyPaths.clear()
+    this.dirtyFullRepos.clear()
     this.needsDiscover = false
+    await this.ensureRepos()
     const present = this.refs.filter((r) => this.repos.some((x) => x.repoRoot === r.repoRoot))
     // A baseline repo whose worktree vanished is data loss in progress — surface it (finding #8).
     this.missingRepos = this.refs
@@ -249,29 +326,61 @@ export class ReviewController {
       .filter((r) => !this.refs.some((x) => x.repoRoot === r.repoRoot))
       .map((r) => ({ repoRoot: r.repoRoot, rel: r.relToWorkspace, agentCreated: this.agentWrites.hasUnder(r.repoRoot) }))
     const raw = await this.engine.collect(present, this.repos, this.shadowDir)
-    this.items = raw.map((it) => this.classify(it))
-    await this.pairMoves()
+    this.setItems(raw.map((it) => this.classify(it)))
+    this.pairMoves()
     this.haveCollected = true
-    this.dirtyRepos.clear()
     this._onDidChange.fire(this.state())
-    this.log.info(`collect FULL: ${this.items.length} file(s)${this.missingRepos.length ? `; ${this.missingRepos.length} MISSING repo(s)` : ''}`)
+    this.log.info(`collect FULL ${Date.now() - started}ms: ${this.items.length} file(s)${this.missingRepos.length ? `; ${this.missingRepos.length} MISSING repo(s)` : ''}`)
     return true
   }
 
   private async scopedCollect(): Promise<boolean> {
-    const dirty = [...this.dirtyRepos].filter(
+    const started = Date.now()
+    const pathsSnapshot = new Map(this.dirtyPaths)
+    const fullSnapshot = new Set(this.dirtyFullRepos)
+    // Clear BEFORE awaiting Git. New events land in fresh collections and cannot be erased.
+    for (const root of pathsSnapshot.keys()) this.dirtyPaths.delete(root)
+    for (const root of fullSnapshot) this.dirtyFullRepos.delete(root)
+    const dirty = [...new Set([...pathsSnapshot.keys(), ...fullSnapshot])].filter(
       (root) => this.repos.some((x) => x.repoRoot === root) && this.refs.some((r) => r.repoRoot === root),
     )
-    this.dirtyRepos.clear()
-    if (dirty.length === 0) return true // nothing relevant changed → skip the collect entirely
+    if (dirty.length === 0) return true
     const refsSubset = this.refs.filter((r) => dirty.includes(r.repoRoot))
-    const raw = await this.engine.collect(refsSubset, this.repos, this.shadowDir)
+    const pathRequests = dirty.map((repoRoot) => ({
+      repoRoot,
+      paths: fullSnapshot.has(repoRoot) ? undefined : [...(pathsSnapshot.get(repoRoot) ?? [])],
+    }))
+    let raw: ChangeItem[]
+    try {
+      raw = await this.engine.collect(refsSubset, this.repos, this.shadowDir, pathRequests)
+    } catch (e) {
+      // A transient Git/worker failure must not consume the dirty generation.
+      for (const [root, paths] of pathsSnapshot) {
+        const pending = this.dirtyPaths.get(root) ?? new Set<string>()
+        for (const p of paths) pending.add(p)
+        this.dirtyPaths.set(root, pending)
+      }
+      for (const root of fullSnapshot) this.markRepoFull(root)
+      throw e
+    }
     const fresh = raw.map((it) => this.classify(it))
-    // Replace ONLY the affected repos' items; keep the rest as last collected.
-    this.items = this.items.filter((i) => !dirty.includes(i.repoRoot)).concat(fresh)
-    await this.pairMoves() // move-pairing is within-repo; re-running on the merged list is idempotent
+    // Expand display-only move pairs back to their authoritative add+delete rows before
+    // merging, then re-pair by blob OID in O(changes).
+    const expanded = this.items.flatMap((i) =>
+      i.movedFrom
+        ? [{ ...i, status: 'add' as const, oldPath: undefined, movedFrom: undefined }, i.movedFrom]
+        : [i],
+    )
+    const affected = (i: ReviewItem): boolean => {
+      if (fullSnapshot.has(i.repoRoot)) return true
+      const paths = pathsSnapshot.get(i.repoRoot)
+      return paths !== undefined && [...paths].some((p) => p === '.' || i.path === p || i.path.startsWith(p.replace(/\/$/, '') + '/'))
+    }
+    this.setItems(expanded.filter((i) => !affected(i)).concat(fresh))
+    this.pairMoves()
     this._onDidChange.fire(this.state())
-    this.log.info(`collect SCOPED (${dirty.length} repo): ${this.items.length} file(s)`)
+    const nPaths = [...pathsSnapshot.values()].reduce((n, s) => n + s.size, 0)
+    this.log.info(`collect PATH ${Date.now() - started}ms (${dirty.length} repo, ${nPaths} path): ${this.items.length} file(s)`)
     return true
   }
 
@@ -279,40 +388,30 @@ export class ReviewController {
   // git's rename detection can couple unrelated same-content files, SPEC T11). That reads
   // as confusing duplication in the tree, so pair BYTE-IDENTICAL del+add rows into one
   // 'moved' row for display. Moves-with-edits keep their honest D + A rows.
-  private async pairMoves(): Promise<void> {
+  private pairMoves(): void {
     const dels = this.items.filter((i) => i.status === 'del' && !i.isBinary)
     if (dels.length === 0) return
-    const adds = this.items.filter((i) => i.status === 'add' && !i.isBinary)
+    const byBlob = new Map<string, ReviewItem[]>()
     for (const del of dels) {
-      const base = del.path.split('/').pop()
-      const cands = adds.filter(
-        (a) => a.repoRoot === del.repoRoot && a.path.split('/').pop() === base && !a.movedFrom,
-      )
-      if (cands.length === 0) continue
-      let baseline: { exists: boolean; binary?: boolean; text?: string }
-      try {
-        baseline = await this.baselineContent(del)
-      } catch {
-        continue
-      }
-      if (!baseline.exists || baseline.binary) continue
-      for (const a of cands) {
-        let cur: string
-        try {
-          cur = fs.readFileSync(a.abs, 'utf8')
-        } catch {
-          continue
-        }
-        if (cur === baseline.text) {
-          a.status = 'rename'
-          a.oldPath = del.path
-          a.movedFrom = del
-          a.hunks = [] // whole-file "+" hunks vs empty baseline are meaningless for a pure move
-          this.items = this.items.filter((x) => x !== del)
-          break
-        }
-      }
+      if (!del.oldOid) continue
+      const key = `${del.repoRoot}\0${del.path.split('/').pop()}\0${del.oldOid}`
+      const list = byBlob.get(key) ?? []
+      list.push(del)
+      byBlob.set(key, list)
     }
+    const paired = new Set<ReviewItem>()
+    for (const add of this.items) {
+      if (add.status !== 'add' || add.isBinary || !add.newOid) continue
+      const key = `${add.repoRoot}\0${add.path.split('/').pop()}\0${add.newOid}`
+      const del = byBlob.get(key)?.find((d) => !paired.has(d))
+      if (!del) continue
+      paired.add(del)
+      add.status = 'rename'
+      add.oldPath = del.path
+      add.movedFrom = del
+      add.hunks = []
+    }
+    if (paired.size > 0) this.setItems(this.items.filter((i) => !paired.has(i)))
   }
 
   // Co-touch detection (SPEC open risk #1), done here because the engine can't know
@@ -444,7 +543,8 @@ export class ReviewController {
         await this.engine.revertFile(asAdd, this.refs, this.repos, this.shadowDir, allowCoTouched)
         await this.engine.revertFile(del, this.refs, this.repos, this.shadowDir, allowCoTouched)
         this.pushUndo(`还原移动 ${del.path} → ${item.path}`, pre, this.captureFiles(paths))
-        this.dirtyRepos.add(item.repoRoot)
+        this.markPathDirty(item.abs)
+        this.markPathDirty(del.abs)
         await this.doRefresh('auto')
         return paths
       })
@@ -458,7 +558,7 @@ export class ReviewController {
       const pre = this.captureFiles(paths)
       await this.engine.revertFile(fresh, this.refs, this.repos, this.shadowDir, allowCoTouched)
       this.pushUndo(`撤销文件 ${item.path}`, pre, this.captureFiles(paths))
-      this.dirtyRepos.add(item.repoRoot)
+      this.markPathDirty(item.abs)
       await this.doRefresh('auto')
       return paths
     })
@@ -485,7 +585,7 @@ export class ReviewController {
       // context mismatch — a safe, atomic-per-file failure surfaced to the user.
       await this.engine.revertHunk(fresh, hunk, this.repos, fresh.attribution !== 'agent')
       this.pushUndo(`撤销块 ${item.path}#${hunkIndex + 1}`, pre, this.captureFiles(paths))
-      this.dirtyRepos.add(item.repoRoot)
+      this.markPathDirty(item.abs)
       await this.doRefresh('auto')
       return paths
     })
@@ -502,7 +602,7 @@ export class ReviewController {
       const pre = this.captureFiles(paths)
       await this.engine.revertRepo(repoRoot, this.refs, this.items, this.repos, this.shadowDir, agentAdded)
       this.pushUndo(`撤销仓库 ${path.basename(repoRoot)}`, pre, this.captureFiles(paths))
-      this.dirtyRepos.add(repoRoot)
+      this.markRepoFull(repoRoot)
       await this.doRefresh('auto')
       return paths
     })

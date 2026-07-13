@@ -2,7 +2,7 @@
   "name": "oc-review",
   "displayName": "OC Review — opencode change review",
   "description": "Review, navigate and roll back opencode's edits across nested git repos; inline diff marks and quick-ask about any selection.",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "publisher": "aleygey",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/aleygey/opencode-review" },
@@ -120,6 +120,12 @@
           "default": [],
           "description": "Extra directory NAMES to skip when discovering repos and watching for changes (on top of the built-in .git/node_modules/build/dist/… list). Speeds up scanning on a huge workspace. WARNING: opencode edits inside an excluded dir won't be reviewable — only exclude generated/vendored dirs the agent never touches."
         },
+        "ocReview.includePaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Optional workspace-relative subtrees to protect (empty = whole workspace). Paths outside this scope are not reviewed or revertible. Use for very large monorepos."
+        },
         "ocReview.autoCheckpoint": {
           "type": "string",
           "enum": ["turn", "off"],
@@ -148,6 +154,7 @@
     "build": "node esbuild.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test test/pure.test.ts",
+    "test:integration": "node esbuild.mjs && node --test test/engineHost.integration.test.ts",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {

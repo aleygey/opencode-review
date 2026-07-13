@@ -60,6 +60,14 @@ try {
   const all = time('collect FULL after 1-file edit', () => collectChanges(refs, repos, { shadowDir: SHADOW }))
   console.log(`  -> ${all.length} changed file(s)`)
 
+  const pathFast = time('collect PATH fast lane (1 exact file)', () =>
+    collectChanges(refs, repos, {
+      shadowDir: SHADOW,
+      pathsByRepo: new Map([[repos[0].repoRoot, ['src/m0/f0.c']]]),
+    }),
+  )
+  console.log(`  -> ${pathFast.length} changed file(s)`)
+
   // Scoped collect (only the changed repo) — available after the optimization.
   const topRoot = repos[0].repoRoot
   const scopedRepos = repos.filter((r) => r.repoRoot === topRoot)
