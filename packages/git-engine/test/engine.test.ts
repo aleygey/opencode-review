@@ -130,6 +130,38 @@ test('T9: collect captures untracked add, deletion and binary; omits gitignored'
   assert.ok(!byPath.has('secret.ign'), 'gitignored file omitted')
 })
 
+test('T26: collect reuses a warm index across refreshes and stays authoritative', (t) => {
+  const { root, shadow } = mkWorkspace(t)
+  initRepo(root)
+  fs.writeFileSync(path.join(root, 'a.txt'), 'a\n')
+  fs.writeFileSync(path.join(root, 'b.txt'), 'b\n')
+  commitAll(root)
+  const repos = discoverRepos(root)
+  const cps = checkpoint(repos, { shadowDir: shadow, id: ID })
+
+  // Refresh 1: one edit (this call seeds the persistent index).
+  fs.writeFileSync(path.join(root, 'a.txt'), 'a-edited\n')
+  let byPath = new Map(collectChanges(cps, repos, { shadowDir: shadow }).map((i) => [i.path, i]))
+  assert.deepEqual([...byPath.keys()].sort(), ['a.txt'], 'refresh 1 sees only a.txt')
+
+  // Refresh 2 (warm index): a NEW edit + a NEW untracked file + a deletion must all be picked
+  // up — proves the reused index is reconciled to the current worktree, not stale.
+  fs.writeFileSync(path.join(root, 'b.txt'), 'b-edited\n')
+  fs.writeFileSync(path.join(root, 'c.txt'), 'c-new\n')
+  removeFileSync(path.join(root, 'a.txt'))
+  byPath = new Map(collectChanges(cps, repos, { shadowDir: shadow }).map((i) => [i.path, i]))
+  assert.equal(byPath.get('a.txt')?.status, 'del', 'a.txt now deleted')
+  assert.equal(byPath.get('b.txt')?.status, 'mod', 'b.txt modified')
+  assert.equal(byPath.get('c.txt')?.status, 'add', 'c.txt added')
+
+  // Refresh 3 (warm index): revert everything to baseline → zero changes reported.
+  fs.writeFileSync(path.join(root, 'a.txt'), 'a\n')
+  fs.writeFileSync(path.join(root, 'b.txt'), 'b\n')
+  removeFileSync(path.join(root, 'c.txt'))
+  const items = collectChanges(cps, repos, { shadowDir: shadow })
+  assert.deepEqual(items, [], 'worktree back at baseline → clean, no phantom entries from the warm index')
+})
+
 test('T14: revertFile restores byte-exact content (no CRLF corruption under autocrlf=true)', (t) => {
   const { root, shadow } = mkWorkspace(t)
   initRepo(root, true)

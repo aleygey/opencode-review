@@ -6,10 +6,16 @@ import { runGit, gitText, gitOk, NO_CRLF } from './git.ts'
 import { repoKey } from './paths.ts'
 import { shadowRepoPath, excludePathspecsForAdd } from './checkpoint.ts'
 
-let counter = 0
-function tmpIndexPath(key: string): string {
-  counter += 1
-  return path.join(os.tmpdir(), `oc-col-${key}-${process.pid}-${Date.now()}-${counter}`)
+// A PERSISTENT per-repo index, reused across refreshes so git's stat cache makes each
+// `add -A` re-hash ONLY the files whose size/mtime changed since last refresh — turning a
+// refresh from O(whole worktree) into O(changed files). This is safe here (but NOT for
+// checkpoint) because the `isUnderNested` filter below drops any stale nested-repo entry a
+// warm index could retain if the nested-repo set changes mid-session; checkpoint has no such
+// post-filter and must keep starting from an empty index. Keyed by pid so two VSCode windows
+// on the same repo never write the same index file; on process restart the first collect is a
+// cold full hash, then warm. os.tmpdir() is fine — the cache is disposable, git rebuilds it.
+function collectIndexPath(baseDir: string, repoRoot: string): string {
+  return path.join(baseDir, `oc-col-idx-${repoKey(repoRoot)}-${process.pid}`)
 }
 
 // The checkpoint commit is a dangling object in the repo (durable only in the shadow). If it
@@ -64,15 +70,24 @@ export function collectChanges(
     const cwd = repoRoot
     if (opts?.shadowDir) ensureCommitPresent(repoRoot, cp, opts.shadowDir)
 
-    const idx = tmpIndexPath(repoKey(repoRoot))
-    try {
-      try { fs.rmSync(idx, { force: true }) } catch {}
+    const baseDir = opts?.shadowDir || os.tmpdir()
+    try { fs.mkdirSync(baseDir, { recursive: true }) } catch {}
+    const idx = collectIndexPath(baseDir, repoRoot)
+    {
       const env = { GIT_INDEX_FILE: idx }
       const excl = repo.nestedChildren.map((c) => `:(exclude,literal)${c}`)
 
       // `add` gets the ignore-filtered excludes (a gitignored child in ANY pathspec makes
       // add exit 1 — SPEC T25); diff-index has no such trap, so it keeps the full list.
-      const add = runGit([...NO_CRLF, 'add', '-A', '--', '.', ...excludePathspecsForAdd(repo.nestedChildren, cwd, env)], cwd, env)
+      // The index is PERSISTENT (see collectIndexPath): git reuses its stat cache and only
+      // re-hashes files that actually changed. If a warm index is stale/corrupt the add fails
+      // — wipe it and retry once from empty (a one-time cold hash) so we self-heal, never wedge.
+      const addArgs = [...NO_CRLF, 'add', '-A', '--', '.', ...excludePathspecsForAdd(repo.nestedChildren, cwd, env)]
+      let add = runGit(addArgs, cwd, env)
+      if (add.status !== 0) {
+        try { fs.rmSync(idx, { force: true }) } catch {}
+        add = runGit(addArgs, cwd, env)
+      }
       if (add.status !== 0) throw new Error(`collect add failed in ${cwd}: ${add.stderr.trim()}`)
 
       // --no-renames = authoritative revert model (an -M R100 fabricated from an unrelated
@@ -115,8 +130,8 @@ export function collectChanges(
         // user edits requires an AgentWriteRecord (SPEC open risk #1), wired at P1.
         items.push({ repoRoot, path: p, status, isBinary, modeChange, hunks, patchHeader, coTouchedByUser: false })
       }
-    } finally {
-      try { fs.rmSync(idx, { force: true }) } catch {}
+      // The index is deliberately NOT deleted — it persists as the warm stat cache for the
+      // next refresh. A corrupt one self-heals via the retry-from-empty above.
     }
   }
   return items
