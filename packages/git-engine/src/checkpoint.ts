@@ -2,7 +2,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import * as fs from 'node:fs'
 import type { RepoInfo, CheckpointRef } from './types.ts'
-import { runGit, gitText, gitOk, NO_CRLF, ADD_QUIET } from './git.ts'
+import { runGit, gitText, gitOk, NO_CRLF, ADD_QUIET, type GitEnv } from './git.ts'
 import { repoKey } from './paths.ts'
 
 let counter = 0
@@ -11,10 +11,19 @@ function tmpIndexPath(key: string): string {
   return path.join(os.tmpdir(), `oc-cp-${key}-${process.pid}-${Date.now()}-${counter}`)
 }
 
-function excludePathspecs(nestedChildren: string[]): string[] {
-  // ':(exclude,literal)<child>' — literal (not glob) so it covers the whole subtree AND
-  // never over-matches a sibling like `moda/` when a nested repo is `mod[a]/` (SPEC T7).
-  return nestedChildren.map((c) => `:(exclude,literal)${c}`)
+// ':(exclude,literal)<child>' — literal (not glob) so it covers the whole subtree AND
+// never over-matches a sibling like `moda/` when a nested repo is `mod[a]/` (SPEC T7).
+// A child that is itself gitignored gets NO pathspec at all: `git add` treats any
+// command-line pathspec naming an ignored path — even an exclude — as an explicit
+// request, prints "The following paths are ignored by one of your .gitignore files"
+// and exits 1. Ignored directories are skipped by `add -A -- .` wholesale, so the
+// exclude is redundant for them anyway (SPEC T25).
+export function excludePathspecsForAdd(nestedChildren: string[], cwd: string, env?: GitEnv): string[] {
+  return nestedChildren
+    // -q: exit 0 = ignored, drop the exclude; 1 (not ignored) or 128 (error) keep it,
+    // so an odd failure degrades to the old behavior, never toward T6 gitlink embedding.
+    .filter((c) => runGit(['check-ignore', '-q', '--', c], cwd, env).status !== 0)
+    .map((c) => `:(exclude,literal)${c}`)
 }
 
 export function shadowRepoPath(shadowDir: string, repoRoot: string): string {
@@ -43,7 +52,7 @@ export function checkpoint(
     try {
       try { fs.rmSync(idx, { force: true }) } catch {}
       const env = { GIT_INDEX_FILE: idx }
-      const excl = excludePathspecs(repo.nestedChildren)
+      const excl = excludePathspecsForAdd(repo.nestedChildren, cwd, env)
 
       // Temp index starts EMPTY; `add -A -- .` therefore snapshots the whole worktree
       // (tracked+untracked, honoring .gitignore) without ever opening the real index.

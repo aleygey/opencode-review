@@ -107,7 +107,7 @@ rm -f "$repo/$agentAddedPath"    # (B) 只删 agent 新增;绝不 git clean / gi
 # (C) 若 agent 删了嵌套 repo 目录:从 shadow 恢复 → git init → raw blob write
 ```
 
-## 测试矩阵(25 例)
+## 测试矩阵(26 例)
 
 T1 checkpoint 外层含嵌套:tree 无 160000;status/HEAD/branch/stash/真 index 的 write-tree 前后一致;只多一条 shadow ref。
 T2 无排除 → 复现 gitlink 吞文件(证明排除是载荷)。
@@ -133,6 +133,7 @@ T21 安全整仓库回滚:raw blob write 全部 + 只 rm agent 新增 → 用户
 T22 `read-tree -u --reset` 无 GIT_INDEX_FILE → 毁用户暂存(证明必须临时 index / raw blob)。
 T23 父层 `git -C outer apply` 用 nested/ 路径 → 泄漏进子仓库(证明 -C 不挡边界,需前缀守卫)。
 T24 agent `rm -rf nested/` 后:存 repo 内 → 基线不可恢复;存外部 shadow → ref 仍在,可恢复整棵嵌套基线。
+T25 嵌套 repo 本身被 .gitignore 忽略(如 `.opencode`/`source_code`):`:(exclude)` pathspec 点名被忽略路径会让 `git add` 报 "paths are ignored" 并退出 1 → 用 check-ignore 过滤,被忽略的子仓库不发 exclude(add -A 本就整体跳过);checkpoint/collect 成功且 tree 仍无该子树。
 T25 用 `.git/index` 的 md5 当不变量是**假的**(git 读时 stat-refresh);真不变量 = status + HEAD + for-each-ref + stash + 真 index 的 write-tree。
 
 ## 开放风险 / 集成依赖

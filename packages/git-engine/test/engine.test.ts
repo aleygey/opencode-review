@@ -248,3 +248,36 @@ test('T24: checkpoint is self-contained in an external shadow store (survives wo
   const blobSha = git(['rev-parse', `${cp.commit}:inner.txt`], shadowRepo).trim()
   assert.equal(gitBuf(['cat-file', 'blob', blobSha], shadowRepo).toString('utf8'), 'precious\n', 'baseline recoverable from shadow alone')
 })
+
+test('T25: checkpoint/collect succeed when a nested repo is itself gitignored', (t) => {
+  const { root, shadow } = mkWorkspace(t)
+  initRepo(root)
+  fs.writeFileSync(path.join(root, 'top.txt'), 'a\n')
+  fs.writeFileSync(path.join(root, '.gitignore'), '.opencode\nsource_code\n')
+  commitAll(root)
+  // Both gitignored nested repos AND a non-ignored one, so the ignore filter and the
+  // exclude pathspec are exercised in the same checkpoint.
+  for (const name of ['.opencode', 'source_code', 'plain_nested']) {
+    const nested = path.join(root, name)
+    initRepo(nested)
+    fs.writeFileSync(path.join(nested, 'inner.txt'), 'x\n')
+    commitAll(nested)
+  }
+
+  const repos = discoverRepos(root)
+  const cps = checkpoint(repos, { shadowDir: shadow, id: ID }) // must not throw "paths are ignored"
+  const cp = cps.get(topRootOf(root))!
+  const treeFiles = git(['ls-tree', '-r', '--name-only', cp.commit], root).split('\n').filter(Boolean)
+  assert.ok(treeFiles.includes('top.txt'))
+  for (const name of ['.opencode', 'source_code', 'plain_nested']) {
+    assert.ok(!treeFiles.some((f) => f === name || f.startsWith(name + '/')), `${name} not in checkpoint tree`)
+  }
+
+  fs.writeFileSync(path.join(root, 'new.txt'), 'hello\n')
+  fs.writeFileSync(path.join(root, '.opencode', 'state.json'), '{}\n')
+  const items = collectChanges(cps, repos, { shadowDir: shadow })
+  const topItems = items.filter((i) => i.repoRoot === topRootOf(root))
+  assert.deepEqual(topItems.map((i) => i.path), ['new.txt'], 'top repo reports only its own change')
+  // the gitignored nested repo is still an independent repo with its own baseline
+  assert.ok(items.some((i) => i.path === 'state.json' && i.repoRoot !== topRootOf(root)))
+})

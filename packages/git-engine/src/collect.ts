@@ -4,7 +4,7 @@ import * as fs from 'node:fs'
 import type { RepoInfo, CheckpointRef, ChangeItem, ChangeStatus, Hunk } from './types.ts'
 import { runGit, gitText, gitOk, NO_CRLF } from './git.ts'
 import { repoKey } from './paths.ts'
-import { shadowRepoPath } from './checkpoint.ts'
+import { shadowRepoPath, excludePathspecsForAdd } from './checkpoint.ts'
 
 let counter = 0
 function tmpIndexPath(key: string): string {
@@ -70,7 +70,9 @@ export function collectChanges(
       const env = { GIT_INDEX_FILE: idx }
       const excl = repo.nestedChildren.map((c) => `:(exclude,literal)${c}`)
 
-      const add = runGit([...NO_CRLF, 'add', '-A', '--', '.', ...excl], cwd, env)
+      // `add` gets the ignore-filtered excludes (a gitignored child in ANY pathspec makes
+      // add exit 1 — SPEC T25); diff-index has no such trap, so it keeps the full list.
+      const add = runGit([...NO_CRLF, 'add', '-A', '--', '.', ...excludePathspecsForAdd(repo.nestedChildren, cwd, env)], cwd, env)
       if (add.status !== 0) throw new Error(`collect add failed in ${cwd}: ${add.stderr.trim()}`)
 
       // --no-renames = authoritative revert model (an -M R100 fabricated from an unrelated
