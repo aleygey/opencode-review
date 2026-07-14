@@ -1,0 +1,14 @@
+{
+  "name": "@oc-review/opencode-plugin",
+  "version": "0.12.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/opencode-review-plugin.js",
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "test": "npm run build && node --test test/shell.test.ts test/plugin.test.ts"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}

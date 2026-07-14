@@ -2,13 +2,18 @@
   "name": "oc-review",
   "displayName": "OC Review — opencode change review",
   "description": "Review, navigate and roll back opencode's edits across nested git repos; inline diff marks and quick-ask about any selection.",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "publisher": "aleygey",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/aleygey/opencode-review" },
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onView:ocReview.changes",
+    "onCommand:ocReview.connect",
+    "onCommand:ocReview.installCompanion",
+    "onCommand:ocReview.quickAsk"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "views": {
@@ -18,10 +23,14 @@
     },
     "commands": [
       { "command": "ocReview.connect", "category": "OC Review", "title": "Connect to opencode Server" },
+      { "command": "ocReview.installCompanion", "category": "OC Review", "title": "Install/Upgrade OpenCode Companion Plugin", "icon": "$(cloud-download)" },
       { "command": "ocReview.checkpoint", "category": "OC Review", "title": "Checkpoint Now (New Baseline)", "icon": "$(history)" },
       { "command": "ocReview.refresh", "category": "OC Review", "title": "Refresh", "icon": "$(refresh)" },
-      { "command": "ocReview.acceptAll", "category": "OC Review", "title": "Accept All (New Baseline)", "icon": "$(check-all)" },
+      { "command": "ocReview.acceptAll", "category": "OC Review", "title": "Accept Reviewed Epoch", "icon": "$(check-all)" },
       { "command": "ocReview.openDiff", "category": "OC Review", "title": "Diff", "icon": "$(diff)" },
+      { "command": "ocReview.openConflictBase", "category": "OC Review", "title": "Compare Conflict Base", "icon": "$(git-compare)" },
+      { "command": "ocReview.openConflictOurs", "category": "OC Review", "title": "Compare Conflict Ours", "icon": "$(git-compare)" },
+      { "command": "ocReview.openConflictTheirs", "category": "OC Review", "title": "Compare Conflict Theirs", "icon": "$(git-compare)" },
       { "command": "ocReview.revertFile", "category": "OC Review", "title": "Revert File", "icon": "$(discard)" },
       { "command": "ocReview.revertHunk", "category": "OC Review", "title": "Revert Hunk", "icon": "$(discard)" },
       { "command": "ocReview.revertRepo", "category": "OC Review", "title": "Revert Repo" },
@@ -32,7 +41,7 @@
       { "command": "ocReview.clearAskThreads", "category": "OC Review", "title": "Clear Ask Threads" },
       { "command": "ocReview.renameBaseline", "category": "OC Review", "title": "Rename Baseline (Note)" },
       { "command": "ocReview.toggleViewMode", "category": "OC Review", "title": "Toggle Tree/List View" },
-      { "command": "ocReview.markReviewed", "category": "OC Review", "title": "Toggle Reviewed" },
+      { "command": "ocReview.markReviewed", "category": "OC Review", "title": "Toggle Reviewed", "icon": "$(check)" },
       { "command": "ocReview.nextChange", "category": "OC Review", "title": "Next Change" },
       { "command": "ocReview.prevChange", "category": "OC Review", "title": "Previous Change" },
       { "command": "ocReview.toggleInline", "category": "OC Review", "title": "Toggle Inline Marks" },
@@ -52,21 +61,26 @@
         { "command": "ocReview.revertFile", "when": "resourcePath in ocReview.changedPaths", "group": "3_compare@2" }
       ],
       "view/title": [
-        { "command": "ocReview.checkpoint", "when": "view == ocReview.changes", "group": "navigation@1" },
+        { "command": "ocReview.installCompanion", "when": "view == ocReview.changes", "group": "1_more@0" },
+        { "command": "ocReview.checkpoint", "when": "view == ocReview.changes && !ocReview.pluginCapture", "group": "navigation@1" },
         { "command": "ocReview.refresh", "when": "view == ocReview.changes", "group": "navigation@2" },
         { "command": "ocReview.acceptAll", "when": "view == ocReview.changes", "group": "navigation@3" },
-        { "command": "ocReview.baselines", "when": "view == ocReview.changes", "group": "1_more@1" },
+        { "command": "ocReview.baselines", "when": "view == ocReview.changes && !ocReview.pluginCapture", "group": "1_more@1" },
         { "command": "ocReview.revertAll", "when": "view == ocReview.changes", "group": "1_more@2" },
         { "command": "ocReview.undoRevert", "when": "view == ocReview.changes", "group": "1_more@3" },
         { "command": "ocReview.redoRevert", "when": "view == ocReview.changes", "group": "1_more@4" },
-        { "command": "ocReview.renameBaseline", "when": "view == ocReview.changes", "group": "1_more@5" },
+        { "command": "ocReview.renameBaseline", "when": "view == ocReview.changes && !ocReview.pluginCapture", "group": "1_more@5" },
         { "command": "ocReview.toggleViewMode", "when": "view == ocReview.changes", "group": "1_more@6" }
       ],
       "view/item/context": [
-        { "command": "ocReview.openDiff", "when": "view == ocReview.changes && viewItem == file", "group": "inline@1" },
-        { "command": "ocReview.revertFile", "when": "view == ocReview.changes && viewItem == file", "group": "inline@2" },
-        { "command": "ocReview.revertFile", "when": "view == ocReview.changes && viewItem == file", "group": "1_mod@1" },
-        { "command": "ocReview.markReviewed", "when": "view == ocReview.changes && viewItem == file", "group": "1_mod@2" },
+        { "command": "ocReview.openDiff", "when": "view == ocReview.changes && (viewItem == file || viewItem == conflictFile)", "group": "inline@1" },
+        { "command": "ocReview.revertFile", "when": "view == ocReview.changes && (viewItem == file || viewItem == conflictFile)", "group": "inline@2" },
+        { "command": "ocReview.markReviewed", "when": "view == ocReview.changes && (viewItem == file || viewItem == conflictFile)", "group": "inline@3" },
+        { "command": "ocReview.revertFile", "when": "view == ocReview.changes && (viewItem == file || viewItem == conflictFile)", "group": "1_mod@1" },
+        { "command": "ocReview.markReviewed", "when": "view == ocReview.changes && (viewItem == file || viewItem == conflictFile)", "group": "1_mod@2" },
+        { "command": "ocReview.openConflictBase", "when": "view == ocReview.changes && viewItem == conflictFile", "group": "2_conflict@1" },
+        { "command": "ocReview.openConflictOurs", "when": "view == ocReview.changes && viewItem == conflictFile", "group": "2_conflict@2" },
+        { "command": "ocReview.openConflictTheirs", "when": "view == ocReview.changes && viewItem == conflictFile", "group": "2_conflict@3" },
         { "command": "ocReview.revertRepo", "when": "view == ocReview.changes && viewItem == repoDir", "group": "1_mod@1" }
       ],
       "comments/commentThread/context": [
@@ -82,6 +96,29 @@
     "configuration": {
       "title": "OC Review",
       "properties": {
+        "ocReview.captureMode": {
+          "type": "string",
+          "enum": ["plugin", "legacy-git"],
+          "default": "plugin",
+          "description": "plugin captures only paths touched by OpenCode tools and performs no workspace scan. legacy-git retains the v0.11 checkpoint/scanner workflow. Reload the window after changing this setting."
+        },
+        "ocReview.shellPolicy": {
+          "type": "string",
+          "enum": ["strict", "audit", "off"],
+          "default": "audit",
+          "description": "Companion handling for shell/custom tools whose writes cannot be proven: strict blocks them, audit records a visible coverage gap, off ignores them. Known shell mutators without declared outputs are always blocked."
+        },
+        "ocReview.enforceReview": {
+          "type": "boolean",
+          "default": true,
+          "description": "Block the next mutating OpenCode turn in the same session until the previous closed epoch has been reviewed and accepted in VS Code."
+        },
+        "ocReview.maxBlobBytes": {
+          "type": "integer",
+          "minimum": 1048576,
+          "default": 20971520,
+          "description": "Maximum size of one file snapshot captured by the companion plugin. Oversized files remain visible but cannot be restored byte-for-byte."
+        },
         "ocReview.serverUrl": {
           "type": "string",
           "default": "",
@@ -130,7 +167,7 @@
           "type": "string",
           "enum": ["turn", "off"],
           "default": "turn",
-          "description": "turn = automatically checkpoint all repos when an opencode turn starts (only if the previous review is clean)."
+          "description": "Legacy Git mode only: turn automatically checkpoints all discovered repos when an opencode turn starts."
         },
         "ocReview.shadowDir": {
           "type": "string",
@@ -151,11 +188,12 @@
     }
   },
   "scripts": {
-    "build": "node esbuild.mjs",
+    "build:plugin": "node ../opencode-plugin/esbuild.mjs",
+    "build": "npm run build:plugin && node esbuild.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/pure.test.ts",
-    "test:integration": "node esbuild.mjs && node --test test/engineHost.integration.test.ts",
-    "package": "vsce package --no-dependencies"
+    "test": "npm run build:plugin && node --test ../protocol/test/protocol.test.ts ../opencode-plugin/test/shell.test.ts ../opencode-plugin/test/plugin.test.ts test/pure.test.ts test/capture.test.ts",
+    "test:integration": "npm run build && node --test test/engineHost.integration.test.ts",
+    "package": "npm run build && vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

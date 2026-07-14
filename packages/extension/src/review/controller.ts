@@ -5,6 +5,9 @@ import { EngineClient, absOf, type RepoInfo, type CheckpointRef, type ChangeItem
 import { DELETED_MARKER, type AgentWriteStore } from '../opencode/agentWrites.ts'
 import type { Log } from '../log.ts'
 import { normcase } from '../lib/pathcase.ts'
+import { JournalCaptureStore, type JournalGap } from '../capture/journal.ts'
+import type { MaterializedChange } from '../capture/diff.ts'
+import { includeInPluginBatchRevert } from './revertPolicy.ts'
 
 export type Attribution = 'agent' | 'user' | 'unverified' | 'co-touched'
 
@@ -15,6 +18,15 @@ export type ReviewItem = ChangeItem & {
   // Display-level move pairing: this 'rename' row absorbs a byte-identical delete row.
   // Revert still executes as delete+add underneath (safe model, SPEC T11).
   movedFrom?: ReviewItem
+  reviewKey?: string
+  epochIDs?: string[]
+  sessionIDs?: string[]
+  tools?: string[]
+  instanceRoots?: string[]
+  beforeSnapshot?: MaterializedChange['beforeSnapshot']
+  afterSnapshot?: MaterializedChange['afterSnapshot']
+  beforeBlob?: string
+  conflict?: MaterializedChange['conflict']
 }
 
 export type ReviewState = {
@@ -27,14 +39,22 @@ export type ReviewState = {
   // Repos discovered AFTER the baseline was taken (e.g. a repo cloned/created mid-session).
   // They have no checkpoint, so their changes are INVISIBLE until adopted — must be surfaced.
   newRepos: { repoRoot: string; rel: string; agentCreated: boolean }[]
+  coverageGaps: JournalGap[]
+  pluginInstances: number
 }
 
 const KEY_BASELINE = 'ocReview.baseline.v1'
 const KEY_BASELINE_PREV = 'ocReview.baseline.prev.v1' // one-step recovery from an accidental re-baseline
 const KEY_HISTORY = 'ocReview.baseline.history.v1'
+const KEY_REVIEWED_JOURNAL = 'ocReview.reviewed.journal.v1'
 const HISTORY_CAP = 30
 
 export type StoredBaseline = { id: string; at: number; refs: CheckpointRef[]; note?: string }
+
+type DiskState =
+  | { kind: 'missing' }
+  | { kind: 'file'; data: Buffer; mode?: number }
+  | { kind: 'symlink'; target: string }
 
 export class ReviewController {
   private repos: RepoInfo[] = []
@@ -60,6 +80,7 @@ export class ReviewController {
   private haveCollected = false // we hold a valid items snapshot to merge onto
   private refreshRequested: 'auto' | 'full' | undefined
   private refreshRunning: Promise<boolean> | undefined
+  private journalSubscription: vscode.Disposable | undefined
 
   // All mutating engine operations run through one promise chain: an explicit
   // "Checkpoint Now" queues behind an in-flight collect instead of silently no-oping.
@@ -83,6 +104,7 @@ export class ReviewController {
     private readonly agentWrites: AgentWriteStore,
     private readonly memento: vscode.Memento,
     private readonly log: Log,
+    private readonly journal?: JournalCaptureStore,
   ) {
     const stored = memento.get<StoredBaseline>(KEY_BASELINE)
     if (stored?.id && Array.isArray(stored.refs)) {
@@ -92,6 +114,44 @@ export class ReviewController {
       this.refs = stored.refs
       this.log.info(`restored baseline ${stored.id} (${stored.refs.length} repos)`)
     }
+    for (const key of memento.get<string[]>(KEY_REVIEWED_JOURNAL, [])) this.reviewed.add(key)
+    this.journalSubscription = this.journal?.onDidChange(() => this.syncJournal())
+    if (this.pluginMode()) this.syncJournal()
+  }
+
+  private pluginMode(): boolean {
+    return vscode.workspace.getConfiguration('ocReview').get<string>('captureMode', 'plugin') === 'plugin'
+  }
+
+  private syncJournal(): void {
+    if (!this.pluginMode() || !this.journal) return
+    const raw = this.journal.items()
+    const repos = new Map<string, RepoInfo>()
+    for (const item of raw) {
+      if (!repos.has(item.repoRoot)) {
+        repos.set(item.repoRoot, {
+          repoRoot: item.repoRoot,
+          relToWorkspace: path.relative(this.workspaceRoot, item.repoRoot).split(path.sep).join('/') || '.',
+          nestedChildren: [],
+        })
+      }
+    }
+    this.repos = [...repos.values()]
+    this.refs = []
+    this.baselineId = raw.length || this.journal.gaps().length || this.journal.matchedInstances().length ? 'plugin-journal' : undefined
+    this.baselineAt = raw.length ? (this.baselineAt ?? Date.now()) : undefined
+    this.baselineNote = raw.length ? 'OpenCode mutation journal' : undefined
+    this.missingRepos = []
+    this.newRepos = []
+    this.setItems(
+      raw.map((item) => ({
+        ...item,
+        attribution: item.coTouchedByUser ? 'co-touched' as const : 'agent' as const,
+        reviewed: this.reviewed.has(item.reviewKey),
+        hunks: item.hunks.map((hunk) => ({ ...hunk, agentAttributed: !item.coTouchedByUser })),
+      })),
+    )
+    this._onDidChange.fire(this.state())
   }
 
   state(): ReviewState {
@@ -103,10 +163,13 @@ export class ReviewController {
       items: this.items,
       missingRepos: this.missingRepos,
       newRepos: this.newRepos,
+      coverageGaps: this.pluginMode() ? (this.journal?.gaps() ?? []) : [],
+      pluginInstances: this.pluginMode() ? (this.journal?.matchedInstances().length ?? 0) : 0,
     }
   }
 
   hasBaseline(): boolean {
+    if (this.pluginMode()) return Boolean(this.baselineId)
     return this.refs.length > 0
   }
 
@@ -122,6 +185,7 @@ export class ReviewController {
   }
 
   async ensureRepos(): Promise<RepoInfo[]> {
+    if (this.pluginMode()) return this.repos
     const skip = vscode.workspace.getConfiguration('ocReview').get<string[]>('excludeDirs', [])
     const include = vscode.workspace.getConfiguration('ocReview').get<string[]>('includePaths', [])
     this.repos = await this.engine.discover(this.workspaceRoot, skip, include)
@@ -134,8 +198,34 @@ export class ReviewController {
   }
 
   // New baseline = checkpoint every repo now; clears review marks.
-  newBaseline(reason: string, note?: string): Promise<void> {
+  newBaseline(reason: string, note?: string, allowedCoverageGaps: string[] = []): Promise<void> {
+    if (this.pluginMode()) return this.serialize(() => this.acceptJournal(reason, allowedCoverageGaps))
     return this.serialize(() => this.doNewBaseline(reason, note))
+  }
+
+  private async acceptJournal(reason: string, allowedCoverageGaps: string[]): Promise<void> {
+    if (!this.journal) throw new Error('OpenCode journal is unavailable')
+    await this.journal.refresh(true)
+    this.syncJournal()
+    const unreviewed = this.items.filter((item) => !item.reviewed)
+    if (unreviewed.length) throw new Error(`${unreviewed.length} file(s) are not reviewed`)
+    const gaps = this.journal.gaps()
+    const approved = new Set(allowedCoverageGaps)
+    const unapprovedGaps = gaps.filter((gap) => !approved.has(`${gap.instanceRoot}\0${gap.epochID}\0${gap.callID}`))
+    if (unapprovedGaps.length) {
+      throw new Error(`${unapprovedGaps.length} new or unacknowledged shell coverage gap(s) require explicit acknowledgement`)
+    }
+    // Keep changed epochs reviewable even when the user reverted every file back to the
+    // captured baseline and the visible item list is therefore empty.
+    const epochs = [...this.journal.mutationEpochs()]
+    const closed = this.journal.closedEpochs()
+    const open = epochs.filter((epoch) => !closed.has(epoch))
+    if (open.length) throw new Error(`opencode is still writing in ${open.length} epoch(s); wait for session idle`)
+    await this.journal.acknowledge(epochs)
+    this.reviewed.clear()
+    await this.memento.update(KEY_REVIEWED_JOURNAL, [])
+    this.log.info(`journal accepted (${reason}): ${epochs.length} epoch(s), ${this.items.length} file(s)`)
+    this.syncJournal()
   }
 
   private async doNewBaseline(reason: string, note?: string): Promise<void> {
@@ -179,6 +269,7 @@ export class ReviewController {
   // snapshot must never be trusted here — a pending refresh means turn-1 edits may not be
   // collected yet, and blindly re-baselining would silently absorb them (review finding #0).
   async onTurnStart(): Promise<void> {
+    if (this.pluginMode()) return
     if (!this.hasBaseline()) {
       await this.newBaseline('turn-start (first)')
       return
@@ -200,6 +291,7 @@ export class ReviewController {
   // Map a changed path to its deepest owning repo and retain the exact repo-relative path.
   // Returns false for paths intentionally outside the configured review scope.
   markPathDirty(abs: string): boolean {
+    if (this.pluginMode()) return false
     const base = path.basename(abs)
     if (base === '.git' || abs.split(/[\\/]/).includes('.git')) {
       this.needsDiscover = true
@@ -254,6 +346,10 @@ export class ReviewController {
   private static readonly REFRESH_MAX_WAIT = 5000 // live preview cap; session.idle flushes sooner
 
   scheduleRefresh(delayMs = 800): void {
+    if (this.pluginMode()) {
+      void this.journal?.refresh()
+      return
+    }
     const now = Date.now()
     if (this.refreshFirstAt === undefined) this.refreshFirstAt = now
     if (this.refreshTimer) clearTimeout(this.refreshTimer)
@@ -271,6 +367,13 @@ export class ReviewController {
   // Returns true when the collect ran to completion (state is authoritative).
   // 'auto' = scoped when possible (only dirty repos), 'full' = discover + collect everything.
   refresh(mode: 'auto' | 'full' = 'auto'): Promise<boolean> {
+    if (this.pluginMode()) {
+      return (async () => {
+        await this.journal?.refresh(mode === 'full')
+        this.syncJournal()
+        return true
+      })()
+    }
     // Coalesce all refresh requests into one drain loop. A slow repository can therefore
     // never accumulate an unbounded chain of stale scans every REFRESH_MAX_WAIT milliseconds.
     if (mode === 'full' || this.refreshRequested === undefined) this.refreshRequested = mode
@@ -292,6 +395,11 @@ export class ReviewController {
   }
 
   private async doRefresh(mode: 'auto' | 'full'): Promise<boolean> {
+    if (this.pluginMode()) {
+      await this.journal?.refresh(mode === 'full')
+      this.syncJournal()
+      return true
+    }
     if (!this.hasBaseline()) {
       this._onDidChange.fire(this.state())
       return true
@@ -455,44 +563,68 @@ export class ReviewController {
   }
 
   toggleReviewed(item: ReviewItem): void {
-    const key = `${item.repoRoot}\0${item.path}`
+    const key = item.reviewKey ?? `${item.repoRoot}\0${item.path}`
     if (this.reviewed.has(key)) this.reviewed.delete(key)
     else this.reviewed.add(key)
     item.reviewed = this.reviewed.has(key)
+    if (this.pluginMode()) void this.memento.update(KEY_REVIEWED_JOURNAL, [...this.reviewed])
     this._onDidChange.fire(this.state())
   }
 
   // ---- undo/redo for revert operations (byte-level pre/post snapshots, in-memory) ----
 
-  private undoStack: { label: string; pre: Map<string, Buffer | null>; post: Map<string, Buffer | null> }[] = []
+  private undoStack: { label: string; pre: Map<string, DiskState>; post: Map<string, DiskState> }[] = []
   private redoStack: typeof this.undoStack = []
 
-  private captureFiles(paths: string[]): Map<string, Buffer | null> {
-    const m = new Map<string, Buffer | null>()
+  private captureFiles(paths: string[]): Map<string, DiskState> {
+    const m = new Map<string, DiskState>()
     for (const abs of paths) {
       try {
-        m.set(abs, fs.readFileSync(abs))
-      } catch {
-        m.set(abs, null) // absent
+        const stat = fs.lstatSync(abs)
+        if (stat.isSymbolicLink()) m.set(abs, { kind: 'symlink', target: fs.readlinkSync(abs) })
+        else if (stat.isFile()) {
+          m.set(abs, {
+            kind: 'file',
+            data: fs.readFileSync(abs),
+            mode: process.platform === 'win32' ? undefined : stat.mode & 0o777,
+          })
+        } else throw new Error(`refusing to snapshot non-file path: ${abs}`)
+      } catch (error: any) {
+        if (error?.code === 'ENOENT') m.set(abs, { kind: 'missing' })
+        else throw error
       }
     }
     return m
   }
 
-  private applyFiles(m: Map<string, Buffer | null>): void {
-    for (const [abs, buf] of m) {
-      if (buf === null) {
-        try {
-          fs.rmSync(abs, { force: true })
-        } catch {}
-      } else {
-        fs.mkdirSync(path.dirname(abs), { recursive: true })
-        fs.writeFileSync(abs, buf)
+  private applyFiles(m: Map<string, DiskState>): void {
+    for (const [abs, state] of m) {
+      let current: fs.Stats | undefined
+      try { current = fs.lstatSync(abs) } catch (error: any) {
+        if (error?.code !== 'ENOENT') throw error
+      }
+      if (current?.isDirectory() && !current.isSymbolicLink()) {
+        throw new Error(`refusing to replace directory: ${abs}`)
+      }
+      if (state.kind === 'missing') {
+        if (current) fs.rmSync(abs, { force: true })
+        continue
+      }
+      fs.mkdirSync(path.dirname(abs), { recursive: true })
+      if (current?.isSymbolicLink() || state.kind === 'symlink') {
+        if (current) fs.rmSync(abs, { force: true })
+      }
+      if (state.kind === 'symlink') fs.symlinkSync(state.target, abs)
+      else {
+        fs.writeFileSync(abs, state.data)
+        if (state.mode) {
+          try { fs.chmodSync(abs, state.mode) } catch {}
+        }
       }
     }
   }
 
-  private pushUndo(label: string, pre: Map<string, Buffer | null>, post: Map<string, Buffer | null>): void {
+  private pushUndo(label: string, pre: Map<string, DiskState>, post: Map<string, DiskState>): void {
     this.undoStack.push({ label, pre, post })
     if (this.undoStack.length > 20) this.undoStack.shift()
     this.redoStack.length = 0
@@ -532,6 +664,18 @@ export class ReviewController {
   // Every revert returns the affected abs paths (for agent notification) and records a
   // byte-level pre/post snapshot for undo/redo.
   revertFile(item: ReviewItem, allowCoTouched: boolean): Promise<string[]> {
+    if (this.pluginMode()) {
+      return this.serialize(async () => {
+        if (!this.journal) throw new Error('OpenCode journal is unavailable')
+        if (item.coTouchedByUser && !allowCoTouched) throw new Error(`'${item.path}' was edited after the agent write`)
+        const pre = this.captureFiles([item.abs])
+        this.journal.restoreFile(item as MaterializedChange)
+        this.pushUndo(`撤销文件 ${item.path}`, pre, this.captureFiles([item.abs]))
+        await this.journal.refresh(true)
+        this.syncJournal()
+        return [item.abs]
+      })
+    }
     // A paired move reverts BOTH halves atomically: delete the moved-to file, restore the
     // original location — one undo entry.
     if (item.movedFrom) {
@@ -565,6 +709,19 @@ export class ReviewController {
   }
 
   revertHunk(item: ReviewItem, hunkIndex: number, allowUnverified = false): Promise<string[]> {
+    if (this.pluginMode()) {
+      return this.serialize(async () => {
+        if (item.coTouchedByUser && !allowUnverified) throw new Error(`'${item.path}' was edited after the agent write`)
+        const hunk = item.hunks[hunkIndex]
+        if (!hunk) throw new Error(`no hunk #${hunkIndex}`)
+        const pre = this.captureFiles([item.abs])
+        await this.engine.revertHunk(item, hunk, this.repos, Boolean(item.coTouchedByUser))
+        this.pushUndo(`撤销块 ${item.path}#${hunkIndex + 1}`, pre, this.captureFiles([item.abs]))
+        await this.journal?.refresh(true)
+        this.syncJournal()
+        return [item.abs]
+      })
+    }
     return this.serialize(async () => {
       const fresh = this.classify(item)
       // A genuinely co-touched hunk mixes user + agent lines — reverse-applying it loses
@@ -592,6 +749,21 @@ export class ReviewController {
   }
 
   revertRepo(repoRoot: string, deleteAgentAdded: boolean): Promise<string[]> {
+    if (this.pluginMode()) {
+      return this.serialize(async () => {
+        if (!this.journal) throw new Error('OpenCode journal is unavailable')
+        const items = this.items.filter((item) =>
+          item.repoRoot === repoRoot && includeInPluginBatchRevert(item, deleteAgentAdded),
+        )
+        const paths = items.map((item) => item.abs)
+        const pre = this.captureFiles(paths)
+        for (const item of items) this.journal.restoreFile(item as MaterializedChange)
+        this.pushUndo(`撤销仓库 ${path.basename(repoRoot)}`, pre, this.captureFiles(paths))
+        await this.journal.refresh(true)
+        this.syncJournal()
+        return paths
+      })
+    }
     return this.serialize(async () => {
       const agentAdded = deleteAgentAdded
         ? this.items
@@ -609,13 +781,28 @@ export class ReviewController {
   }
 
   async baselineContent(item: Pick<ReviewItem, 'repoRoot' | 'path'>): Promise<{ exists: boolean; binary?: boolean; text?: string }> {
+    if (this.pluginMode()) {
+      const abs = path.join(item.repoRoot, item.path)
+      const current = this.itemFor(abs)
+      if (!current || !this.journal) return { exists: false }
+      return this.journal.baselineContent(current as MaterializedChange)
+    }
     return this.engine.baselineContent(item.repoRoot, item.path, this.refs, this.shadowDir)
+  }
+
+  conflictContent(
+    item: ReviewItem,
+    side: 'base' | 'ours' | 'theirs',
+  ): { exists: boolean; binary?: boolean; text?: string } {
+    if (!this.pluginMode() || !this.journal || !item.conflict) return { exists: false }
+    return this.journal.conflictContent(item as MaterializedChange, side)
   }
 
   // Bring a repo that appeared after the baseline into it (checkpoint = its CURRENT content).
   // Caller must confirm with the user first — for an agent-created repo this accepts the
   // agent's current output as baseline (nothing before adoption is revertable).
   adoptRepo(repoRoot: string): Promise<void> {
+    if (this.pluginMode()) return Promise.reject(new Error('plugin capture discovers repositories lazily; adoption is not required'))
     return this.serialize(async () => {
       if (!this.baselineId) throw new Error('no baseline to adopt into')
       const repo = this.repos.find((r) => r.repoRoot === repoRoot)
@@ -635,6 +822,17 @@ export class ReviewController {
   }
 
   explainPath(abs: string): Promise<import('../engineClient.ts').PathExplanation> {
+    if (this.pluginMode()) {
+      const item = this.itemFor(abs)
+      if (!item) return Promise.resolve({ owned: false })
+      return Promise.resolve({
+        owned: true,
+        repoRoot: item.repoRoot,
+        rel: item.path,
+        repoHasBaseline: true,
+        inBaseline: item.beforeSnapshot?.kind !== 'missing',
+      })
+    }
     return this.engine.explainPath(abs, this.repos, this.refs, this.shadowDir)
   }
 
@@ -647,6 +845,7 @@ export class ReviewController {
   }
 
   history(): StoredBaseline[] {
+    if (this.pluginMode()) return []
     return this.memento.get<StoredBaseline[]>(KEY_HISTORY, [])
   }
 
@@ -683,6 +882,7 @@ export class ReviewController {
   // Make a HISTORICAL baseline the review base (disk untouched): the change list then
   // shows the CUMULATIVE diff since that baseline — review or batch-revert from there.
   switchBaseline(id: string): Promise<void> {
+    if (this.pluginMode()) return Promise.reject(new Error('historical Git baselines are available only in legacy-git mode'))
     return this.serialize(async () => {
       const target = id === this.baselineId ? undefined : this.history().find((b) => b.id === id)
       if (!target) return
@@ -703,6 +903,19 @@ export class ReviewController {
   // Batch rollback: revert EVERY repo to the current review baseline. Only agent-attributed
   // added files are deleted; unknown/user adds are kept (they reappear in the list after).
   revertAll(): Promise<string[]> {
+    if (this.pluginMode()) {
+      return this.serialize(async () => {
+        if (!this.journal) throw new Error('OpenCode journal is unavailable')
+        const items = this.items.filter((item) => includeInPluginBatchRevert(item, true))
+        const paths = items.map((item) => item.abs)
+        const pre = this.captureFiles(paths)
+        for (const item of items) this.journal.restoreFile(item as MaterializedChange)
+        this.pushUndo('批量回退 OpenCode journal', pre, this.captureFiles(paths))
+        await this.journal.refresh(true)
+        this.syncJournal()
+        return paths
+      })
+    }
     return this.serialize(async () => {
       const present = this.refs.filter((r) => this.repos.some((x) => x.repoRoot === r.repoRoot))
       const paths = this.items.map((i) => i.abs)
@@ -722,6 +935,7 @@ export class ReviewController {
 
   dispose(): void {
     if (this.refreshTimer) clearTimeout(this.refreshTimer)
+    this.journalSubscription?.dispose()
     this._onDidChange.dispose()
   }
 }

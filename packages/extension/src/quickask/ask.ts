@@ -12,6 +12,7 @@ type StoredThread = {
   start: number
   end: number
   sessionID?: string
+  forked?: boolean
   selection?: string
   comments: { author: string; body: string }[]
 }
@@ -19,15 +20,16 @@ type StoredThread = {
 // Quick-ask as INLINE COMMENT THREADS (VSCode's built-in Comments UI — the same substrate
 // GitHub PR reviews use). No webview, no session picker, no model config:
 //  - the thread anchors to the FULL selection range (highlighted alongside the code),
-//  - the question goes to the session that last WROTE this file (fallback: last active
-//    session in this workspace; fallback: a new session),
-//  - the model is whatever that session already uses,
+//  - the question forks the session that last WROTE this file (fallback: last active
+//    session in this workspace; fallback: a new isolated session),
+//  - the fork keeps context but disables mutating tools,
 //  - threads are PERSISTED per workspace and restored on reload — an annotation record.
 // The widget chrome (collapse button, full editor width) is fixed by VSCode and not stylable.
 export class AskThreads {
   private readonly cc: vscode.CommentController
   private readonly threads: vscode.CommentThread[] = []
   private readonly sessionByThread = new WeakMap<vscode.CommentThread, string>()
+  private readonly parentByThread = new WeakMap<vscode.CommentThread, string>()
   private readonly selectionByThread = new WeakMap<vscode.CommentThread, string>()
 
   constructor(
@@ -130,17 +132,32 @@ export class AskThreads {
     const lang = doc.languageId
 
     this.append(thread, '你', question)
-    this.append(thread, 'opencode', '⏳ 已发送,等待回答…(同一 session,opencode 终端里也能看到)')
+    this.append(thread, 'opencode', '⏳ 已发送,等待只读回答…')
 
     const threadLines: number[] = []
     if (thread.range) for (let l = thread.range.start.line; l <= thread.range.end.line; l++) threadLines.push(l)
-    const sessionID =
-      this.sessionByThread.get(thread) ?? (await this.resolveSession(client, thread.uri.fsPath, threadLines))
+    let sessionID = this.sessionByThread.get(thread)
     if (!sessionID) {
-      this.replaceLast(thread, 'opencode', '找不到可用 session,也无法创建 — 看 OC Review 输出面板。')
-      return
+      const parentID = this.parentByThread.get(thread) ?? (await this.resolveSession(client, thread.uri.fsPath, threadLines))
+      if (!parentID) {
+        this.replaceLast(thread, 'opencode', '找不到可用 session,也无法创建 — 看 OC Review 输出面板。')
+        return
+      }
+      this.parentByThread.set(thread, parentID)
+      try {
+        sessionID = await client.forkSession(parentID)
+      } catch (error: any) {
+        this.log.warn(`quick-ask fork failed, using an isolated session: ${error?.message ?? error}`)
+        try {
+          sessionID = await client.createSession('VS Code quick ask (read-only)', this.workspaceRoot)
+        } catch (createError: any) {
+          this.log.error(`quick-ask session creation failed: ${createError?.message ?? createError}`)
+          this.replaceLast(thread, 'opencode', '无法创建只读问答 session — 看 OC Review 输出面板。')
+          return
+        }
+      }
+      this.sessionByThread.set(thread, sessionID)
     }
-    this.sessionByThread.set(thread, sessionID)
 
     const prompt = [
       `关于 \`${rel}\` 第 ${startLine}${endLine !== startLine ? `-${endLine}` : ''} 行的代码:`,
@@ -154,7 +171,21 @@ export class AskThreads {
     ].join('\n')
 
     try {
-      const res = await client.prompt(sessionID, prompt, undefined, new AbortController().signal)
+      const res = await client.prompt(sessionID, prompt, undefined, new AbortController().signal, {
+        agent: 'explore',
+        system: 'This is an OC Review read-only question. Explain the selected code. Do not modify files or run mutating commands.',
+        tools: {
+          edit: false,
+          write: false,
+          patch: false,
+          apply_patch: false,
+          multiedit: false,
+          bash: false,
+          shell: false,
+          task: false,
+          batch: false,
+        },
+      })
       this.replaceLast(thread, 'opencode', res.text.trim() || '(空回答 — 看 OC Review 输出面板)')
     } catch (e: any) {
       this.log.error(`quick-ask failed: ${e?.message ?? e}`)
@@ -174,6 +205,7 @@ export class AskThreads {
         start: t.range?.start.line ?? 0,
         end: t.range?.end.line ?? 0,
         sessionID: this.sessionByThread.get(t),
+        forked: this.sessionByThread.has(t),
         selection: this.selectionByThread.get(t),
         comments: t.comments.map((c) => ({
           author: c.author.name,
@@ -196,7 +228,8 @@ export class AskThreads {
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed
         thread.canReply = true
         thread.label = '问 opencode'
-        if (s.sessionID) this.sessionByThread.set(thread, s.sessionID)
+        if (s.sessionID && s.forked) this.sessionByThread.set(thread, s.sessionID)
+        else if (s.sessionID) this.parentByThread.set(thread, s.sessionID)
         if (s.selection) this.selectionByThread.set(thread, s.selection)
         this.threads.push(thread)
       } catch {

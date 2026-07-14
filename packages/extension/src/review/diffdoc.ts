@@ -2,6 +2,7 @@ import * as vscode from 'vscode'
 import type { ReviewController, ReviewItem } from './controller.ts'
 
 export const SCHEME = 'ocreview-base'
+export const SNAPSHOT_SCHEME = 'ocreview-snapshot'
 
 // Virtual documents serving the BASELINE content of a file, for the left side of vscode.diff.
 export class BaselineDocProvider implements vscode.TextDocumentContentProvider {
@@ -49,6 +50,32 @@ export class BaselineDocProvider implements vscode.TextDocumentContentProvider {
   }
 }
 
+export class SnapshotDocProvider implements vscode.TextDocumentContentProvider {
+  constructor(private readonly controller: ReviewController) {}
+
+  static uriFor(item: ReviewItem, side: 'base' | 'ours' | 'theirs'): vscode.Uri {
+    return vscode.Uri.from({
+      scheme: SNAPSHOT_SCHEME,
+      path: '/' + item.path,
+      query: JSON.stringify({ abs: item.abs, side, hash: item.conflict?.[side]?.hash }),
+    })
+  }
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    try {
+      const query = JSON.parse(uri.query) as { abs: string; side: 'base' | 'ours' | 'theirs' }
+      const item = this.controller.itemFor(query.abs)
+      if (!item) return '(conflict capture is no longer pending)'
+      const result = this.controller.conflictContent(item, query.side)
+      if (!result.exists) return `(no ${query.side} stage)`
+      if (result.binary) return `(binary ${query.side} stage)`
+      return result.text ?? ''
+    } catch (error: any) {
+      return `(failed to load conflict stage: ${error?.message ?? error})`
+    }
+  }
+}
+
 export async function openDiff(controller: ReviewController, item: ReviewItem): Promise<void> {
   if (item.isBinary) {
     // A text diff of a compiled artifact is meaningless — say so instead of opening
@@ -69,4 +96,18 @@ export async function openDiff(controller: ReviewController, item: ReviewItem): 
     return
   }
   await vscode.commands.executeCommand('vscode.diff', left, right, title, { preview: true })
+}
+
+export async function openConflictDiff(
+  controller: ReviewController,
+  item: ReviewItem,
+  side: 'base' | 'ours' | 'theirs',
+): Promise<void> {
+  if (!item.conflict?.[side]) {
+    void vscode.window.showInformationMessage(`OC Review: no ${side} stage exists for ${item.path}.`)
+    return
+  }
+  const left = SnapshotDocProvider.uriFor(item, side)
+  const right = vscode.Uri.file(item.abs)
+  await vscode.commands.executeCommand('vscode.diff', left, right, `${item.path} (${side} ↔ working conflict)`, { preview: true })
 }

@@ -7,7 +7,14 @@ import { OpencodeClient } from './opencode/client.ts'
 import { AgentWriteStore } from './opencode/agentWrites.ts'
 import { ReviewController, type ReviewItem } from './review/controller.ts'
 import { ChangesTree, type Node } from './review/tree.ts'
-import { BaselineDocProvider, SCHEME, openDiff } from './review/diffdoc.ts'
+import {
+  BaselineDocProvider,
+  SnapshotDocProvider,
+  SCHEME,
+  SNAPSHOT_SCHEME,
+  openConflictDiff,
+  openDiff,
+} from './review/diffdoc.ts'
 import { InlineMarks } from './review/decorations.ts'
 import { RevertLensProvider } from './review/codelens.ts'
 import { ChangedFileDecorations } from './review/filedecor.ts'
@@ -15,6 +22,9 @@ import { Attribution } from './review/attribution.ts'
 import { nextChange, gotoStop } from './review/navigation.ts'
 import { AskThreads } from './quickask/ask.ts'
 import { extractToolEvent } from './lib/sse.ts'
+import { JournalCaptureStore } from './capture/journal.ts'
+import { globalPluginPath, installCompanionPlugin, writePluginConfig } from './capture/install.ts'
+import { reviewDataRoot } from '../../protocol/src/index.ts'
 
 let client: OpencodeClient | undefined
 
@@ -30,6 +40,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       'revertRepo', 'markReviewed', 'nextChange', 'prevChange', 'toggleInline', 'quickAsk', 'diagnose', 'gotoHunk',
       'adoptRepo', 'explainPath', 'askSubmit', 'revertAll', 'baselines', 'undoRevert', 'redoRevert', 'clearAskThreads',
       'renameBaseline', 'toggleViewMode',
+      'installCompanion',
+      'openConflictBase', 'openConflictOurs', 'openConflictTheirs',
     ]
     for (const c of stubs) {
       ctx.subscriptions.push(
@@ -51,7 +63,23 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   ctx.subscriptions.push({ dispose: () => engine.dispose() })
 
   const agentWrites = new AgentWriteStore(workspaceRoot, log)
-  const controller = new ReviewController(workspaceRoot, shadowDir, engine, agentWrites, ctx.workspaceState, log)
+  const journal = new JournalCaptureStore(workspaceRoot, log)
+  const pluginCapture = cfg().get<string>('captureMode', 'plugin') === 'plugin'
+  void vscode.commands.executeCommand('setContext', 'ocReview.pluginCapture', pluginCapture)
+  const syncPluginConfig = () => {
+    try {
+      return writePluginConfig(workspaceRoot)
+    } catch (error: any) {
+      log.warn(`companion config write failed: ${error?.message ?? error}`)
+      return undefined
+    }
+  }
+  if (pluginCapture) {
+    syncPluginConfig()
+    journal.start()
+  }
+  ctx.subscriptions.push(journal)
+  const controller = new ReviewController(workspaceRoot, shadowDir, engine, agentWrites, ctx.workspaceState, log, journal)
   ctx.subscriptions.push(controller)
 
   // ---- UI ----
@@ -60,13 +88,22 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   ctx.subscriptions.push(treeView)
   const baselineDocs = new BaselineDocProvider(controller)
   ctx.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider(SCHEME, baselineDocs))
+  ctx.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider(SNAPSHOT_SCHEME, new SnapshotDocProvider(controller)),
+  )
   const marks = new InlineMarks(controller)
   ctx.subscriptions.push(marks)
   ctx.subscriptions.push(vscode.languages.registerCodeLensProvider({ scheme: 'file' }, new RevertLensProvider(controller)))
   ctx.subscriptions.push(vscode.window.registerFileDecorationProvider(new ChangedFileDecorations(controller)))
   const attribution = new Attribution(controller, agentWrites, log)
-  const askThreads = new AskThreads(() => client, agentWrites, workspaceRoot, ctx.workspaceState, log, (abs, lines) =>
-    attribution.ownerForLines(abs, lines),
+  const askThreads = new AskThreads(
+    () => client,
+    agentWrites,
+    workspaceRoot,
+    ctx.workspaceState,
+    log,
+    async (abs, lines) =>
+      (await attribution.ownerForLines(abs, lines)) ?? controller.itemFor(abs)?.sessionIDs?.at(-1),
   )
   ctx.subscriptions.push(askThreads)
 
@@ -138,9 +175,19 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   const renderStatus = () => {
     const s = controller.state()
     const conn = client?.connected ? '$(plug)' : '$(debug-disconnect)'
-    if (!s.baselineId) status.text = `${conn} OC: no baseline`
-    else status.text = `${conn} OC: ${s.items.length} file(s)`
-    status.tooltip = `OC Review — server: ${client ? client.info.baseUrl : 'not connected'}\nbaseline: ${s.baselineId ?? 'none'}`
+    const unreviewed = s.items.filter((item) => !item.reviewed).length
+    if (cfg().get<string>('captureMode', 'plugin') === 'plugin' && s.pluginInstances === 0) {
+      status.text = '$(warning) OC: plugin missing'
+    } else if (!s.baselineId) status.text = `${conn} OC: no changes`
+    else if (s.coverageGaps.length) {
+      status.text = `$(warning) OC: ${unreviewed}/${s.items.length} review, ${s.coverageGaps.length} gap`
+    } else status.text = `${conn} OC: ${unreviewed}/${s.items.length} review`
+    status.tooltip = [
+      `OC Review — server: ${client ? client.info.baseUrl : 'not connected'}`,
+      `capture: ${cfg().get<string>('captureMode', 'plugin')}`,
+      `companion instances: ${s.pluginInstances}`,
+      `coverage gaps: ${s.coverageGaps.length}`,
+    ].join('\n')
     status.show()
   }
   controller.onDidChange(renderStatus)
@@ -170,7 +217,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         const sid = evt.props?.sessionID ?? evt.props?.info?.id
         if (busy && sid && !turnSeen.has(sid)) {
           turnSeen.add(sid)
-          if (cfg().get<string>('autoCheckpoint', 'turn') === 'turn') {
+          if (!pluginCapture && cfg().get<string>('autoCheckpoint', 'off') === 'turn') {
             void (async () => {
               await controller.onTurnStart()
               // Baseline intent = the prompt that started this turn.
@@ -183,7 +230,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       }
       if (evt.type === 'message.part.updated') {
         const t = extractToolEvent(evt.props)
-        if (t && (t.status === 'pending' || t.status === 'running') && cfg().get<string>('autoCheckpoint', 'turn') === 'turn') {
+        if (t && (t.status === 'pending' || t.status === 'running') && !pluginCapture && cfg().get<string>('autoCheckpoint', 'off') === 'turn') {
           if (!controller.hasBaseline()) void controller.onTurnStart()
         }
         return
@@ -251,7 +298,26 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 
   reg('ocReview.connect', () => connect(true))
 
+  reg('ocReview.installCompanion', async () => {
+    try {
+      const result = installCompanionPlugin(ctx.extensionPath)
+      const configFile = writePluginConfig(workspaceRoot)
+      const action = result.changed ? 'installed' : 'already current'
+      log.info(`companion plugin ${action}: ${result.target}; config: ${configFile}`)
+      void vscode.window.showInformationMessage(
+        `OC Review companion plugin ${action}: ${result.target}. Restart opencode to load it.`,
+      )
+    } catch (error: any) {
+      log.error(`companion install failed: ${error?.stack ?? error}`)
+      void vscode.window.showErrorMessage(`OC Review companion install failed: ${error?.message ?? error}`)
+    }
+  })
+
   reg('ocReview.checkpoint', async () => {
+    if (cfg().get<string>('captureMode', 'plugin') === 'plugin') {
+      void vscode.window.showInformationMessage('Plugin capture creates baselines per touched file; use Accept Reviewed Epoch after review.')
+      return
+    }
     const note = await vscode.window.showInputBox({
       prompt: '这次基线的备注(可选,说明这批改动的意图;直接回车跳过)',
       ignoreFocusOut: true,
@@ -281,14 +347,43 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     tree.refresh()
   })
 
-  reg('ocReview.refresh', () => controller.refresh('full')) // manual refresh = authoritative full scan
+  reg('ocReview.refresh', () => controller.refresh('full'))
 
   reg('ocReview.acceptAll', async () => {
-    const n = controller.state().items.length
-    const yes = await vscode.window.showInformationMessage(`Accept all ${n} change(s) and start a new baseline?`, { modal: true }, 'Accept All')
-    if (yes !== 'Accept All') return
-    await controller.newBaseline('accept-all')
-    await controller.refresh()
+    const state = controller.state()
+    const unreviewed = state.items.filter((item) => !item.reviewed)
+    if (unreviewed.length) {
+      void vscode.window.showWarningMessage(`OC Review: ${unreviewed.length} file(s) still require review.`)
+      return
+    }
+    let allowedGaps: string[] = []
+    if (state.coverageGaps.length) {
+      const details = state.coverageGaps
+        .slice(0, 5)
+        .map((gap) => `• ${gap.command?.slice(0, 100) ?? gap.reason}`)
+        .join('\n')
+      const ack = await vscode.window.showWarningMessage(
+        `${state.coverageGaps.length} command/tool call(s) could not prove their write set:\n${details}` +
+          `${state.coverageGaps.length > 5 ? '\n…' : ''}\nAcknowledge incomplete coverage?`,
+        { modal: true },
+        'Acknowledge gaps',
+      )
+      if (ack !== 'Acknowledge gaps') return
+      allowedGaps = state.coverageGaps.map((gap) => `${gap.instanceRoot}\0${gap.epochID}\0${gap.callID}`)
+    }
+    const label = cfg().get<string>('captureMode', 'plugin') === 'plugin' ? 'Accept Reviewed Epoch' : 'Accept All'
+    const yes = await vscode.window.showInformationMessage(
+      `${label}: ${state.items.length} reviewed file(s)?`,
+      { modal: true },
+      label,
+    )
+    if (yes !== label) return
+    try {
+      await controller.newBaseline('accept-all', undefined, allowedGaps)
+      await controller.refresh()
+    } catch (error: any) {
+      void vscode.window.showWarningMessage(`OC Review: ${error?.message ?? error}`)
+    }
   })
 
   const itemOf = (node: Node | ReviewItem | vscode.Uri | undefined): ReviewItem | undefined => {
@@ -298,12 +393,23 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     if ((node as any).abs) return node as ReviewItem
     return undefined
   }
+  const ownersForItem = async (item: ReviewItem): Promise<string[]> => {
+    const observed = await attribution.ownersForFile(item)
+    return observed.length ? observed : (item.sessionIDs ?? [])
+  }
 
   reg('ocReview.openDiff', async (node?: Node | vscode.Uri) => {
     const item = itemOf(node) ?? controller.itemFor(vscode.window.activeTextEditor?.document.uri.fsPath ?? '')
     if (!item) return
     await openDiff(controller, item)
   })
+
+  for (const side of ['base', 'ours', 'theirs'] as const) {
+    reg(`ocReview.openConflict${side[0].toUpperCase()}${side.slice(1)}`, async (node?: Node | vscode.Uri) => {
+      const item = itemOf(node) ?? controller.itemFor(vscode.window.activeTextEditor?.document.uri.fsPath ?? '')
+      if (item) await openConflictDiff(controller, item, side)
+    })
+  }
 
   reg('ocReview.revertFile', async (node?: Node | vscode.Uri) => {
     const item = itemOf(node)
@@ -327,7 +433,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       if (yes !== 'Revert') return
     }
     try {
-      const targets = new Map([[item.abs, await attribution.ownersForFile(item)]])
+      const targets = new Map([[item.abs, await ownersForItem(item)]])
       const paths = await controller.revertFile(item, allowCoTouched)
       notifyAgent(paths, '回退(revert)', targets)
     } catch (e: any) {
@@ -355,7 +461,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     if (yes !== '撤销此块') return
     try {
       // Block-precise: only the session that WROTE this hunk gets told (falls back to all writers).
-      const targets = new Map([[h.item.abs, await attribution.ownersForHunk(h.item, h.index)]])
+      const hunkOwners = await attribution.ownersForHunk(h.item, h.index)
+      const targets = new Map([[h.item.abs, hunkOwners.length ? hunkOwners : (h.item.sessionIDs ?? [])]])
       const paths = await controller.revertHunk(h.item, h.index, attr !== 'agent')
       notifyAgent(paths, '回退(revert)其中一个改动块于', targets)
     } catch (e: any) {
@@ -407,7 +514,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     if (!choice) return
     try {
       const targets = new Map<string, string[]>()
-      for (const it of items) targets.set(it.abs, await attribution.ownersForFile(it))
+      for (const it of items) targets.set(it.abs, await ownersForItem(it))
       const paths = await controller.revertRepo(repoRoot, choice === 'Revert + delete agent-added')
       notifyAgent(paths, '整仓库回退(revert)', targets)
     } catch (e: any) {
@@ -445,7 +552,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     if (!(await confirmRevertAll())) return
     try {
       const targets = new Map<string, string[]>()
-      for (const it of controller.state().items) targets.set(it.abs, await attribution.ownersForFile(it))
+      for (const it of controller.state().items) targets.set(it.abs, await ownersForItem(it))
       const paths = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'OC Review: 批量回退中…' },
         () => controller.revertAll(),
@@ -496,7 +603,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       if (!(await confirmRevertAll())) return
       try {
         const targets = new Map<string, string[]>()
-        for (const it of controller.state().items) targets.set(it.abs, await attribution.ownersForFile(it))
+        for (const it of controller.state().items) targets.set(it.abs, await ownersForItem(it))
         const paths = await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: 'OC Review: 回退到历史基线…' },
           () => controller.revertAll(),
@@ -599,6 +706,9 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     log.show()
     log.info('--- diagnose ---')
     log.info(`workspace: ${workspaceRoot}`)
+    log.info(`captureMode: ${pluginCapture ? 'plugin' : 'legacy-git'}`)
+    log.info(`reviewDataRoot: ${reviewDataRoot()}`)
+    log.info(`companionTarget: ${globalPluginPath()}`)
     log.info(`shadowDir: ${shadowDir}`)
     try {
       log.info(`engine: ${await engine.ping()}`)
@@ -619,48 +729,71 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     }
     const s = controller.state()
     log.info(`baseline: ${s.baselineId ?? 'none'}; pending changes: ${s.items.length}; agentWrites: ${agentWrites.size}`)
+    log.info(`companion instances: ${s.pluginInstances}; coverage gaps: ${s.coverageGaps.length}`)
+    for (const instance of journal.matchedInstances()) {
+      log.info(`  plugin ${instance.pluginVersion}: ${instance.directory} -> ${instance.journal}`)
+    }
+    for (const gap of s.coverageGaps) {
+      log.warn(`  gap ${gap.epochID}/${gap.callID}: ${gap.reason}${gap.command ? `; ${gap.command}` : ''}`)
+    }
     log.info('--- end diagnose ---')
   })
 
-  // ---- filesystem fallback ----
+  // ---- legacy filesystem fallback ----
   // When opencode work happens on a server we are NOT connected to (e.g. a standalone TUI
   // with its own port), no SSE events arrive. A workspace watcher keeps the change list
   // fresh anyway — degraded mode is then: manual "Checkpoint Now" before the task,
   // automatic refresh after (attribution shows "unverified", which is accurate).
-  const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(wsFolder, '**/*'))
-  // Heavy/generated dirs never carry reviewable source — ignore their churn so the watcher
-  // doesn't wake a refresh for every build artifact.
-  const IGNORE_SEG = new Set([
-    '.git', 'node_modules', 'dist', 'build', 'out', 'target', '.venv', 'venv', '__pycache__',
-    '.cache', '.next', '.turbo', 'vendor', 'coverage', '.oc-review',
-  ])
-  const extraIgnore = () => cfg().get<string[]>('excludeDirs', [])
-  const onFs = (uri: vscode.Uri, kind: 'change' | 'create' | 'delete') => {
-    if (uri.scheme !== 'file') return
-    if (!controller.hasBaseline()) return
-    const p = uri.fsPath
-    const segs = p.split(/[\\/]/)
-    const gitEntryChanged = kind !== 'change' && segs[segs.length - 1] === '.git'
-    if (gitEntryChanged) {
-      controller.markPathDirty(p)
-      controller.scheduleRefresh(300)
-      return
+  if (!pluginCapture) {
+    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(wsFolder, '**/*'))
+    // Heavy/generated dirs never carry reviewable source — ignore their churn so the watcher
+    // doesn't wake a refresh for every build artifact.
+    const IGNORE_SEG = new Set([
+      '.git', 'node_modules', 'dist', 'build', 'out', 'target', '.venv', 'venv', '__pycache__',
+      '.cache', '.next', '.turbo', 'vendor', 'coverage', '.oc-review',
+    ])
+    const extraIgnore = () => cfg().get<string[]>('excludeDirs', [])
+    const onFs = (uri: vscode.Uri, kind: 'change' | 'create' | 'delete') => {
+      if (uri.scheme !== 'file') return
+      if (!controller.hasBaseline()) return
+      const p = uri.fsPath
+      const segs = p.split(/[\\/]/)
+      const gitEntryChanged = kind !== 'change' && segs[segs.length - 1] === '.git'
+      if (gitEntryChanged) {
+        controller.markPathDirty(p)
+        controller.scheduleRefresh(300)
+        return
+      }
+      const configuredIgnore = extraIgnore()
+      if (segs.some((s) => IGNORE_SEG.has(s) || configuredIgnore.includes(s))) return
+      if (!controller.markPathDirty(p)) return
+      controller.scheduleRefresh(1200)
     }
-    const configuredIgnore = extraIgnore()
-    if (segs.some((s) => IGNORE_SEG.has(s) || configuredIgnore.includes(s))) return
-    if (!controller.markPathDirty(p)) return
-    controller.scheduleRefresh(1200)
+    watcher.onDidChange((u) => onFs(u, 'change'))
+    watcher.onDidCreate((u) => onFs(u, 'create'))
+    watcher.onDidDelete((u) => onFs(u, 'delete'))
+    ctx.subscriptions.push(watcher)
   }
-  watcher.onDidChange((u) => onFs(u, 'change'))
-  watcher.onDidCreate((u) => onFs(u, 'create'))
-  watcher.onDidDelete((u) => onFs(u, 'delete'))
-  ctx.subscriptions.push(watcher)
 
   // Scope changes invalidate both repo discovery and the persistent review snapshot.
   ctx.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('ocReview.excludeDirs') || e.affectsConfiguration('ocReview.includePaths')) {
-        void controller.refresh('full')
+        if (!pluginCapture) void controller.refresh('full')
+      }
+      if (
+        e.affectsConfiguration('ocReview.shellPolicy') ||
+        e.affectsConfiguration('ocReview.enforceReview') ||
+        e.affectsConfiguration('ocReview.maxBlobBytes')
+      ) {
+        syncPluginConfig()
+      }
+      if (e.affectsConfiguration('ocReview.captureMode')) {
+        void vscode.window
+          .showInformationMessage('OC Review capture mode changed. Reload the VS Code window to apply it.', 'Reload')
+          .then((choice) => {
+            if (choice === 'Reload') void vscode.commands.executeCommand('workbench.action.reloadWindow')
+          })
       }
     }),
   )

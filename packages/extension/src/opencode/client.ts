@@ -70,6 +70,18 @@ export class OpencodeClient {
     return String(id)
   }
 
+  async forkSession(sessionID: string, title = 'VS Code quick ask'): Promise<string> {
+    const res = await this.json<any>('POST', `/session/${encodeURIComponent(sessionID)}/fork`, {})
+    const id = res?.id ?? res?.data?.id
+    if (!id) throw new Error('forkSession: no id in response')
+    try {
+      await this.json('PATCH', `/session/${encodeURIComponent(String(id))}`, { title })
+    } catch (error: any) {
+      this.log.warn(`forkSession title update failed: ${error?.message ?? error}`)
+    }
+    return String(id)
+  }
+
   // Send a prompt and wait for the completed assistant message. Model field shape has
   // drifted across server versions — try object form, then string, then without model.
   async prompt(
@@ -77,14 +89,25 @@ export class OpencodeClient {
     text: string,
     model: { providerID: string; modelID: string } | undefined,
     signal: AbortSignal,
+    options?: { tools?: Record<string, boolean>; agent?: string; system?: string },
   ): Promise<{ text: string; raw: any }> {
     const parts = [{ type: 'text', text }]
-    const attempts: any[] = []
-    if (model) {
-      attempts.push({ parts, model: { providerID: model.providerID, modelID: model.modelID } })
-      attempts.push({ parts, model: `${model.providerID}/${model.modelID}` })
+    const common = {
+      ...(options?.tools ? { tools: options.tools } : {}),
+      ...(options?.agent ? { agent: options.agent } : {}),
+      ...(options?.system ? { system: options.system } : {}),
     }
-    attempts.push({ parts })
+    const variants = options?.agent
+      ? [common, { ...common, agent: undefined }]
+      : [common]
+    const attempts: any[] = []
+    for (const variant of variants) {
+      if (model) {
+        attempts.push({ ...variant, parts, model: { providerID: model.providerID, modelID: model.modelID } })
+        attempts.push({ ...variant, parts, model: `${model.providerID}/${model.modelID}` })
+      }
+      attempts.push({ ...variant, parts })
+    }
 
     let lastErr: Error | undefined
     for (const body of attempts) {
