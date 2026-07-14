@@ -1,0 +1,54 @@
+name: build-and-test
+
+on:
+  pull_request:
+  push:
+    branches: [main, "agent/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/extension/package-lock.json
+
+      - name: Install extension build dependencies
+        working-directory: packages/extension
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: packages/extension
+        run: npm run typecheck
+
+      - name: Test protocol, companion, and extension logic
+        working-directory: packages/extension
+        run: npm test
+
+      - name: Test legacy Git engine
+        working-directory: packages/git-engine
+        run: npm test
+
+      - name: Test extension worker integration
+        working-directory: packages/extension
+        run: npm run test:integration
+
+      - name: Package VSIX
+        working-directory: packages/extension
+        run: npm run package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oc-review-vsix
+          path: packages/extension/oc-review-*.vsix
+          if-no-files-found: error
+          retention-days: 14

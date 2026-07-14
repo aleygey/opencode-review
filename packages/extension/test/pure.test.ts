@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { parseHunkHeader, mapHunkToNewFile, mapFileMarks, hunkFirstLine } from '../src/lib/hunkmap.ts'
 import { SseParser, normalizeOcEvent, extractToolEvent, extractTextDelta, parseModelString } from '../src/lib/sse.ts'
 import { mapLines, blameLines, majorityOwner } from '../src/lib/blame.ts'
+import { includeInPluginBatchRevert } from '../src/review/revertPolicy.ts'
 
 // ---------- hunkmap ----------
 
@@ -166,4 +167,12 @@ test('parseModelString', () => {
   assert.deepEqual(parseModelString('a/b/c'), { providerID: 'a', modelID: 'b/c' })
   assert.equal(parseModelString(''), undefined)
   assert.equal(parseModelString('nomodel'), undefined)
+})
+
+test('plugin batch revert never deletes user-owned added files', () => {
+  assert.equal(includeInPluginBatchRevert({ status: 'mod', attribution: 'co-touched' }, false), true)
+  assert.equal(includeInPluginBatchRevert({ status: 'add', attribution: 'agent' }, false), false)
+  assert.equal(includeInPluginBatchRevert({ status: 'add', attribution: 'agent' }, true), true)
+  assert.equal(includeInPluginBatchRevert({ status: 'add', attribution: 'co-touched' }, true), false)
+  assert.equal(includeInPluginBatchRevert({ status: 'add', attribution: 'unverified' }, true), false)
 })

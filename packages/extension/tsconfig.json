@@ -12,6 +12,11 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node", "vscode"]
   },
-  "include": ["src/**/*.ts", "../git-engine/src/**/*.ts"],
+  "include": [
+    "src/**/*.ts",
+    "../git-engine/src/**/*.ts",
+    "../protocol/src/**/*.ts",
+    "../opencode-plugin/src/**/*.ts"
+  ],
   "exclude": ["../git-engine/src/cli.ts"]
 }

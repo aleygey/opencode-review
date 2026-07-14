@@ -1,52 +1,139 @@
 # OC Review
 
-[![Release](https://img.shields.io/github/v/release/aleygey/opencode-review)](https://github.com/aleygey/opencode-review/releases)
 [![License](https://img.shields.io/github/license/aleygey/opencode-review)](LICENSE)
 
-OC Review 是一款面向 [opencode](https://opencode.ai) 的 VS Code 扩展。它会记录 AI 修改代码前的基线，并在编辑器中集中展示后续变更，方便你逐文件审查、定位和回退。
+OC Review 是一个 OpenCode companion plugin + VS Code 扩展，用来集中审查 OpenCode 实际写入磁盘的改动。
 
-扩展原生支持一个工作区内存在多个相互独立的 Git 仓库，包括多层嵌套仓库。每个仓库都会单独建立基线，避免子仓库中的修改被遗漏。
+v0.12 默认使用 **OpenCode-first capture**：不遍历工作区、不扫描全部 Git 仓库、不创建全量 checkpoint，也不注册 VS Code `**/*` watcher。OpenCode 插件只记录本轮工具实际触达的路径，VS Code 再按这些路径生成 Diff、标记、导航和回退。
 
-## 功能特性
+这套设计面向以下场景：
 
-- **集中审查变更**：按仓库和目录展示文件及 hunk，并统计新增、删除行数。
-- **基线对比**：使用 VS Code 原生 Diff 编辑器比较基线与当前工作区。
-- **编辑器内标记**：高亮新增行，并在删除位置提供可悬停查看的锚点。
-- **快速导航**：在不同文件和 hunk 之间连续跳转。
-- **多级回退**：支持按 hunk、文件、仓库或整个工作区回退，并可撤销或重做回退操作。
-- **安全归属判断**：区分 agent 修改、人工修改、共同修改和未验证修改，降低误删用户代码的风险。
-- **选区追问**：选中任意代码后直接向当前 opencode 会话提问，不限于已修改的代码。
-- **大工作区优化**：持久化仓库索引，并根据文件事件按路径增量刷新；手动刷新仍会执行完整校验。
+- 超大代码库和性能较弱的开发机。
+- 一个工作区包含多个独立 Git 仓库，且仓库可以嵌套。
+- merge、rebase、cherry-pick 或跨分支搬功能时，需要检查冲突处理是否被粗暴二选一。
+- 希望 OpenCode 连续完成一轮修改后统一审查，而不是每次 edit 都等待 permission reply。
+
+## 工作方式
+
+```text
+OpenCode tool hook
+  ├─ edit/write/apply_patch: 精确捕获触达路径的 before/after
+  ├─ shell: 声明写路径，或产生 coverage gap
+  └─ Git transition: 捕获命令前后状态、HEAD 变化和冲突 stage
+                  │
+                  ▼
+       JSONL journal + content-addressed blobs
+                  │
+                  ▼
+            VS Code OC Review
+  Diff / 行标记 / 快速跳转 / 回退 / Quick Ask / 审核确认
+```
+
+OpenCode 一轮执行期间不会逐次阻塞。session 进入 idle 后，该轮 mutation epoch 才关闭；如果 `ocReview.enforceReview` 为 `true`，同一 session 的**下一次写操作**会等待上一轮在 VS Code 中全部审查并接受。只读工具仍可继续运行。
+
+这不依赖 `permission.edit=ask`，因此不会在每个文件修改处同步等待。
+
+## 功能
+
+- 原生 VS Code Diff：基线内容与当前磁盘内容对比。
+- 编辑器内新增行、删除锚点和 hunk CodeLens。
+- `Ctrl+Alt+PageDown/PageUp` 快速跳转所有改动。
+- 每个文件显式标记 Reviewed；存在未审查文件时不能接受 epoch。
+- 文件在 OpenCode 写入后又被人工修改时标记为 `co-touched`，原审核标记自动失效。
+- 支持按 hunk、文件、仓库或整批回退，并支持撤销/重做回退。
+- Git 冲突保存 `base / ours / theirs`，冲突文件菜单可分别与当前结果比较。
+- `Ctrl+Alt+A` 可询问任意选区；Quick Ask fork 原 session 保留上下文，但禁用写文件、shell 和 task 工具。
+- 未知 shell/custom tool 在 `audit` 模式生成显眼的 coverage gap，接受前必须单独确认。
+- 原 v0.11 Git checkpoint 引擎保留为显式 `legacy-git` 兼容模式。
+
+## 捕获覆盖范围
+
+| 来源 | 默认处理 |
+| --- | --- |
+| `edit`、`write`、`patch`、`apply_patch`、`multiedit` | 工具运行前后精确捕获目标文件。 |
+| `cp`、`mv`、`rm`、`sed -i`、重定向、PowerShell 写命令等 | 没有声明输出路径时阻止，并要求重试。 |
+| `git merge/rebase/cherry-pick/revert/pull/am/commit/checkout/switch/reset/restore/stash` | 自动记录命令前后的 tracked dirty 路径和旧/新 HEAD；冲突时保存 Git stage 1/2/3。支持 `git -C` 和简单的 `cd ... && git ...`。 |
+| `git clean`、`git stash -u/--all`、`git checkout -f` | 可能删除无法从 post-state 推导的未跟踪文件，必须声明准确输出路径。 |
+| test/build/脚本解释器等可能产生文件的命令 | 不假定只读；`audit` 下生成 coverage gap，或用写路径标记声明输出。 |
+| 无法证明只读的 shell/custom tool | `audit`：记录 coverage gap；`strict`：阻止；`off`：放行。 |
+| OpenCode 之外的人工操作、IDE refactor、其他后台进程 | 故意不捕获。它们不属于 OpenCode 改动。 |
+
+对会写文件的 shell 命令，在命令第一行声明准确输出路径：
+
+```bash
+# oc-review-writes: ["services/api/src/a.ts", "services/api/src/b.ts"]
+sed -i 's/old/new/g' services/api/src/a.ts services/api/src/b.ts
+```
+
+该标记在执行前会被 companion 移除，不会改变实际命令。路径相对于 OpenCode 当前目录，也可以使用绝对路径。
 
 ## 环境要求
 
-- VS Code 1.90.0 或更高版本。
-- `git` 已加入 `PATH`。
-- 可访问的 opencode Server，默认地址为 `http://127.0.0.1:4096`。
-- 扩展、工作区文件和 opencode Server 应运行在同一操作系统环境中。
+- VS Code 1.90 或更高版本。
+- OpenCode 支持本地 plugin hooks。
+- `git` 在 `PATH` 中。普通 edit/write 捕获不依赖 Git；Git transition 和文本 Diff 使用 Git。
+- VS Code 扩展 host、OpenCode 和工作区文件必须处于同一操作系统环境。
 
-如果使用 Remote SSH 或 WSL，请在对应的远程 VS Code 窗口中安装扩展，不要只安装在本地窗口。
+> 在 WSL 或 Remote SSH 中运行 OpenCode 时，必须把扩展安装到对应的 WSL/远程扩展 host。只装在本地 Windows 侧无法读取远端 journal 和文件。
 
-## 安装
+## 安装与部署
 
-1. 从 [Releases](https://github.com/aleygey/opencode-review/releases) 下载最新的 `oc-review-*.vsix`。
-2. 在 VS Code 中打开扩展视图。
-3. 点击右上角 `…`，选择 **Install from VSIX...**。
-4. 选择下载的 VSIX 文件并重新加载窗口。
+### 使用 VSIX
 
-当前版本：[下载 OC Review v0.11.0](https://github.com/aleygey/opencode-review/releases/download/v0.11.0/oc-review-0.11.0.vsix)
+1. 获取 `oc-review-0.12.0.vsix`。
+   - GitHub Actions 的 `build-and-test` workflow 会上传名为 `oc-review-vsix` 的 artifact。
+   - 也可以按下方命令从源码本地打包。
+2. 在目标 VS Code 窗口执行 **Extensions: Install from VSIX...**，或运行：
 
-## 快速开始
+   ```bash
+   code --install-extension oc-review-0.12.0.vsix --force
+   ```
 
-### 1. 启动 opencode Server
+3. 打开代码工作区，运行：
 
-在工作区或其上级目录运行：
+   ```text
+   OC Review: Install/Upgrade OpenCode Companion Plugin
+   ```
 
-```bash
-opencode serve
+4. 重启正在运行的 OpenCode 进程，让它重新加载插件。
+
+安装命令会把 VSIX 内置的 companion 写到：
+
+```text
+~/.config/opencode/plugins/opencode-review.js
 ```
 
-为了让 agent 连续完成多文件修改，再由 OC Review 统一审查，建议在 `opencode.jsonc` 中使用以下配置：
+因此带到工位时只需要传一个 VSIX，不需要在工位执行 npm install，也不需要单独复制插件源码。
+
+### WSL / Remote SSH
+
+1. 在已经连接 WSL/SSH 的 VS Code 窗口中选择 **Install from VSIX...**。
+2. 确认扩展显示为“Installed in WSL/SSH”，而不是只安装在 Local。
+3. 在同一个远程窗口运行 companion 安装命令。
+4. 在相同 WSL/SSH 环境中重启 OpenCode。
+
+插件目标路径中的 `~` 属于远程用户。捕获数据默认保存在：
+
+- Linux/WSL/SSH：`$XDG_DATA_HOME/opencode-review` 或 `~/.local/share/opencode-review`
+- Windows：`%LOCALAPPDATA%\opencode-review`
+- 自定义：设置环境变量 `OC_REVIEW_HOME`
+
+### 从源码构建一个离线 VSIX
+
+```bash
+cd packages/extension
+npm ci
+npm run typecheck
+npm test
+npm run test:integration
+npm run package
+```
+
+生成的 `packages/extension/oc-review-0.12.0.vsix` 已包含 companion plugin。
+
+## OpenCode 配置
+
+推荐让 OpenCode 正常连续写入，不使用逐文件 permission gate：
 
 ```jsonc
 {
@@ -57,149 +144,88 @@ opencode serve
 }
 ```
 
-OC Review 使用自己的 Git 基线机制，因此不依赖 opencode 的 snapshot。
+`snapshot: false` 不是强制要求，只是避免同时维护 OpenCode 自带全量 snapshot。OC Review 的回退来自按触达路径保存的 CAS，不依赖 OpenCode snapshot。
 
-### 2. 连接 Server
+捕获本身不需要 `opencode serve`。Quick Ask、session 归属和回退通知需要 HTTP/SSE 连接；可以运行：
 
-打开工作区后，状态栏会显示 `OC: ...`。扩展会先读取 lock 文件，再尝试探测本机端口。
-
-如果没有自动连接，请运行命令：
-
-```text
-OC Review: Connect to opencode Server
+```bash
+opencode serve --port 4096
 ```
 
-也可以通过 `ocReview.serverUrl` 手动指定 Server 地址。
+SSE 是一个长期保持的 HTTP 事件流。OC Review 仅用它接收 session 状态和问答相关事件；即使 SSE 断线，companion 的本地 journal 仍会继续捕获文件改动。
 
-### 3. 创建基线
+## 使用流程
 
-首次使用时运行：
+1. 安装扩展和 companion，重启 OpenCode。
+2. 让 OpenCode 完成一轮修改。
+3. 在 Explorer 的 **OC Review** 视图逐项打开 Diff。
+4. 使用上下文菜单 **Toggle Reviewed** 标记确认过的文件。
+5. 对冲突文件分别查看 Base、Ours、Theirs；必要时用 Quick Ask 询问当前选区。
+6. 全部文件 Reviewed 后运行 **Accept Reviewed Epoch**。
+7. 如果存在 coverage gap，扩展会单独列出并要求显式确认；确认后该 session 的下一轮写操作才会放行。
 
-```text
-OC Review: Checkpoint Now (New Baseline)
-```
+OpenCode 在 `session.idle` 前异常退出时，companion 下次启动会恢复已有成功写入记录的 orphan epoch，不会让这批改动永久卡住。
 
-创建完成后即可让 opencode 修改代码。扩展会监听 agent 写入和文件系统事件，并把相对于基线的变化显示在资源管理器中的 **OC Review** 面板。
+## 主要设置
 
-### 4. 审查并处理变更
-
-- 单击文件打开基线与工作区的 Diff。
-- 展开文件查看各个 hunk。
-- 使用文件或 hunk 右侧的操作按钮执行回退。
-- 确认所有修改后，运行 **Accept All (New Baseline)**，将当前内容设为新基线。
-- 遇到连接、仓库发现或基线问题时，运行 **OC Review: Diagnose** 查看诊断信息。
-
-## 常用命令与快捷键
-
-| 操作 | 命令或快捷键 |
-| --- | --- |
-| 创建新基线 | `OC Review: Checkpoint Now (New Baseline)` |
-| 完整刷新 | `OC Review: Refresh` |
-| 接受全部修改并创建新基线 | `OC Review: Accept All (New Baseline)` |
-| 跳到下一个变更 | `Ctrl+Alt+PageDown` |
-| 跳到上一个变更 | `Ctrl+Alt+PageUp` |
-| 向 opencode 询问选中代码 | `Ctrl+Alt+A` |
-| 切换编辑器内变更标记 | `OC Review: Toggle Inline Marks` |
-| 查看和切换历史基线 | `OC Review: Baselines...` |
-| 回退整个工作区 | `OC Review: Revert All to Baseline` |
-| 诊断问题 | `OC Review: Diagnose` |
-
-完整命令列表可以在 VS Code 命令面板中输入 `OC Review` 查看。
-
-## 大型工作区配置
-
-OC Review 默认监听整个工作区。对于大型 monorepo，可以只保护常用源码目录，并排除确认不会被 agent 修改的生成目录或第三方目录：
-
-```jsonc
-{
-  "ocReview.includePaths": [
-    "src",
-    "packages/app"
-  ],
-  "ocReview.excludeDirs": [
-    "generated",
-    "third_party_cache"
-  ]
-}
-```
-
-默认还会跳过 `.git`、`node_modules`、`dist`、`build`、`out`、`target`、`.venv`、`vendor`、`coverage` 等常见目录。
-
-> [!WARNING]
-> 被排除或未包含的路径不会建立基线，也不会显示在审查列表中，因此无法通过 OC Review 回退。请只排除确定不需要审查的目录。
-
-## 配置项
-
-| 配置 | 默认值 | 说明 |
+| 设置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `ocReview.serverUrl` | 空 | opencode Server 地址；为空时自动发现。 |
-| `ocReview.serverPassword` | 空 | Server 启用 HTTP Basic Auth 时使用的密码。 |
-| `ocReview.probePorts` | `[4096]` | 自动发现时探测的本机端口。 |
-| `ocReview.viewMode` | `tree` | 变更列表显示为目录树或平铺列表。 |
-| `ocReview.autoCheckpoint` | `turn` | 在新一轮 opencode 对话开始且当前审查列表为空时自动创建基线。 |
-| `ocReview.includePaths` | `[]` | 需要审查的工作区相对路径；为空表示整个工作区。 |
-| `ocReview.excludeDirs` | `[]` | 额外排除的目录名称。 |
-| `ocReview.strictAttribution` | `true` | 对未观察到 agent 写入的变更采用保守回退策略。 |
-| `ocReview.inlineMarks` | `true` | 在编辑器中显示行级变更标记。 |
-| `ocReview.codeLens` | `true` | 在变更块上方显示一键回退 CodeLens。 |
-| `ocReview.notifyAgent` | `true` | 回退后通知对应会话重新读取文件，不触发新的模型响应。 |
-| `ocReview.shadowDir` | 空 | 基线影子仓库的存储目录；为空时使用扩展全局存储。 |
+| `ocReview.captureMode` | `plugin` | 默认无扫描捕获；`legacy-git` 启用旧 checkpoint 引擎。切换后需 Reload Window。 |
+| `ocReview.shellPolicy` | `audit` | 未知 shell/custom tool 的策略：`strict`、`audit`、`off`。 |
+| `ocReview.enforceReview` | `true` | 上一轮未接受时，阻止同一 session 的下一次 mutation。 |
+| `ocReview.maxBlobBytes` | `20971520` | 单文件 CAS 上限。超限文件仍显示，但无法保证字节级回退。 |
+| `ocReview.serverUrl` | 空 | OpenCode server 地址；为空时读取 lock 文件并探测端口。 |
+| `ocReview.serverPassword` | 空 | OpenCode server Basic Auth 密码。 |
+| `ocReview.inlineMarks` | `true` | 编辑器内显示行级改动标记。 |
+| `ocReview.codeLens` | `true` | hunk 上方显示回退 CodeLens。 |
+| `ocReview.notifyAgent` | `true` | 回退后向原 session 注入只读通知，不触发模型回复。 |
 
-## 安全模型
+`includePaths`、`excludeDirs`、`shadowDir` 和 `autoCheckpoint` 只影响 `legacy-git` 模式。
 
-- 每个真实 Git 仓库都是独立的基线和回退单元，嵌套仓库不会被父仓库吞掉。
-- 基线保存在独立的 shadow 仓库中，不修改真实仓库的 index，也不会执行 `git clean`。
-- 文件内容按字节恢复；仓库级回退只删除能够确认由 agent 新增的文件。
-- 如果 agent 修改后你又手动编辑了同一文件，该文件会被标记为共同修改，回退前需要再次确认。
-- 扩展没有观察到 agent 写入的变更会被标记为未验证。默认严格模式下，这类变更需要显式确认后才能回退。
-- hunk 级回退使用补丁上下文校验。如果磁盘内容已经发生漂移，操作会安全失败，而不是强行覆盖。
+## 性能模型
 
-## 为什么要按仓库建立基线
+默认 plugin 模式的常驻工作量是：
 
-一个工作区可能包含多个独立 Git 仓库，并且这些仓库不一定是 submodule。使用单一的顶层 shadow worktree 时，Git 可能把内层仓库视为 gitlink，从而漏掉其中的文件修改。
+- 扫描少量 OC Review instance 元数据，而不是工作区目录。
+- 增量读取 append-only JSONL journal。
+- 只对当前未接受 epoch 中已触达的文件检查 `mtime/size`。
+- 仅当该文件变化时重新生成单文件 Diff。
+- 只有执行 Git transition 时，才做一次命令前/后的 repo status 和 commit-tree diff；旧 blob 按触达路径分块、批量读取，不会周期性运行或遍历整棵 tree。
+- blob 按 SHA-256 去重；已接受 journal 在下一次 mutation 时压缩，七天以上且无引用的 blob 每天最多清理一次。
 
-OC Review 会发现工作区内的每个 `.git` 目录或 gitdir 文件，将文件归属到最近的仓库根目录，并分别执行 checkpoint、diff 和 revert。这样既能完整展示嵌套仓库中的修改，也能保证回退操作不会越过仓库边界。
+不会执行：递归 repo discovery、全仓库 `git status` 轮询、全量 checkpoint、全工作区 watcher。
+
+## 诊断
+
+运行：
+
+```text
+OC Review: Diagnose
+```
+
+输出面板会显示 capture mode、数据目录、companion 目标路径、已发现 plugin 版本、journal 路径、coverage gap 和 OpenCode server 状态。
+
+状态栏显示 `OC: plugin missing` 时，通常是 companion 尚未安装，或 OpenCode 安装后还没有重启/执行过任何 hook。
+
+## 已知边界
+
+- 默认模式只保证 OpenCode 内置文件工具、声明写路径的 shell、已识别 Git transition，以及未知工具的显式 gap；它不通过全量扫描猜测外部进程改了什么。
+- `audit` 模式允许无法证明写集合的工具执行，因此 gap 表示“这一段覆盖不完整”。要求绝不放行时使用 `strict`。
+- Git transition 会在命令前后各执行一次 `git status --untracked-files=no`，用于保护已有未提交修改并覆盖 `merge --no-commit`；Git hook 额外生成的未跟踪文件仍应使用路径声明。
+- 超过 `maxBlobBytes` 或不可读文件无法安全回退，扩展会按保守方式标记。
+- 多根 VS Code workspace 当前以第一个 file-scheme workspace folder 为主；一个根目录下的任意数量嵌套仓库均可支持。
+- Windows 对符号链接权限有限；WSL/Linux 能更完整保留 symlink 和 mode。
 
 ## 项目结构
 
 ```text
 packages/
-├── extension/    # VS Code 扩展、opencode 接入和界面
-└── git-engine/   # 多仓库 checkpoint、diff 和回退引擎
+├── protocol/          # VS Code 与 companion 共用的 journal/CAS 协议
+├── opencode-plugin/   # OpenCode tool hooks、epoch barrier、冲突捕获
+├── extension/         # VS Code UI、Diff、导航、Quick Ask、VSIX 打包
+└── git-engine/        # legacy-git 兼容模式
 ```
 
-Git 引擎使用 Node.js 和原生 Git 命令实现，不依赖运行时第三方包。扩展使用 TypeScript、VS Code Extension API 和 esbuild 构建。
+## License
 
-## 本地开发
-
-测试 Git 引擎：
-
-```bash
-cd packages/git-engine
-npm install
-npm test
-```
-
-构建和测试 VS Code 扩展：
-
-```bash
-cd packages/extension
-npm install
-npm run typecheck
-npm test
-npm run test:integration
-npm run build
-npm run package
-```
-
-打包完成后，VSIX 文件会生成在 `packages/extension` 目录中。
-
-## 已知限制
-
-- 扩展需要与 opencode Server 和工作区文件运行在同一操作系统环境中，不负责跨系统路径映射。
-- VS Code Extension API 无法直接创建真正的编辑器 view zone，因此删除内容通过锚点和悬停提示展示；完整内容可在原生 Diff 编辑器中查看。
-- 原生 Windows Git 对文件模式和符号链接的还原能力有限；Linux 和 WSL 下可以保留更多 Git 元数据。
-
-## 许可证
-
-本项目基于 [MIT License](LICENSE) 开源。
+[MIT](LICENSE)

@@ -48,7 +48,7 @@ export function normalizeOcEvent(json: any): OcEvent | undefined {
 
 // ---- tool-event helpers (shared by AgentWriteStore + controller) ----
 
-const FILE_TOOLS = new Set(['edit', 'write', 'patch', 'multiedit'])
+const FILE_TOOLS = new Set(['edit', 'write', 'patch', 'apply_patch', 'multiedit'])
 
 export function toolFilePath(input: any): string | undefined {
   if (!input || typeof input !== 'object') return undefined

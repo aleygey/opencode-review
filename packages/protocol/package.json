@@ -1,0 +1,10 @@
+{
+  "name": "@oc-review/protocol",
+  "version": "0.12.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "node --test test/protocol.test.ts"
+  }
+}

@@ -9,7 +9,7 @@ import type { ReviewController, ReviewItem, ReviewState } from './controller.ts'
 export type DirIndex = Map<string, { dirs: string[]; files: { item: ReviewItem; wsPath: string }[] }>
 
 export type Node =
-  | { kind: 'info'; label: string; desc?: string; warn?: boolean }
+  | { kind: 'info'; label: string; desc?: string; warn?: boolean; command?: vscode.Command }
   | { kind: 'newRepo'; repoRoot: string; rel: string; agentCreated: boolean }
   | { kind: 'dir'; rel: string; repoRoot?: string; index: DirIndex } // repoRoot set when this dir IS a nested repo root
   | { kind: 'file'; item: ReviewItem; wsDir?: string }
@@ -94,6 +94,10 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
     return vscode.workspace.getConfiguration('ocReview').get<string>('viewMode', 'tree') === 'tree'
   }
 
+  private pluginMode(): boolean {
+    return vscode.workspace.getConfiguration('ocReview').get<string>('captureMode', 'plugin') === 'plugin'
+  }
+
   // workspace-relative path of an item = its repo's rel prefix + repo-relative path
   private wsPathOf(item: ReviewItem): string {
     const rel = this.repoRel.get(item.repoRoot) ?? ''
@@ -123,6 +127,7 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
           ? new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'))
           : new vscode.ThemeIcon('info')
         t.contextValue = 'info'
+        t.command = node.command
         if (node.warn) t.tooltip = node.desc
         return t
       }
@@ -182,14 +187,16 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
           const pm = plusMinus(it)
           if (pm) badges.push(pm)
         }
+        if (it.modeChange) badges.push(`mode ${it.modeChange.from.slice(-3)}→${it.modeChange.to.slice(-3)}`)
         if (it.attribution === 'co-touched') badges.push('⚠ co-touched')
         else if (it.attribution === 'unverified') badges.push('unverified')
+        if (it.conflict) badges.push('⚠ conflict')
         if (it.reviewed) badges.push('✓')
         t.description = badges.join(' · ')
-        t.contextValue = 'file'
+        t.contextValue = it.conflict ? 'conflictFile' : 'file'
         t.id = `file:${it.repoRoot}:${it.path}`
         t.tooltip = new vscode.MarkdownString(
-          `**${this.wsPathOf(it)}**  \nstatus: ${it.status}${it.isBinary ? ' (binary)' : ''}  \nattribution: ${it.attribution}${it.reviewed ? '  \n✓ reviewed' : ''}  \nrepo: ${it.repoRoot}`,
+          `**${this.wsPathOf(it)}**  \nstatus: ${it.status}${it.isBinary ? ' (binary)' : ''}${it.conflict ? ' (unmerged conflict)' : ''}  \nattribution: ${it.attribution}${it.reviewed ? '  \n✓ reviewed' : ''}  \nrepo: ${it.repoRoot}`,
         )
         t.command = { command: 'ocReview.openDiff', title: 'Diff', arguments: [node] }
         return t
@@ -201,7 +208,14 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
     if (!node) {
       const s = this.state
       if (!s.baselineId) {
-        return [{ kind: 'info', label: 'No baseline yet', desc: 'Run "OC Review: Checkpoint Now"' }]
+        return this.pluginMode()
+          ? [{
+              kind: 'info',
+              label: 'Install OpenCode companion plugin',
+              desc: 'restart OpenCode after installation',
+              command: { command: 'ocReview.installCompanion', title: 'Install Companion' },
+            }]
+          : [{ kind: 'info', label: 'No baseline yet', desc: 'Run "OC Review: Checkpoint Now"' }]
       }
       const when = s.baselineAt ? new Date(s.baselineAt).toLocaleTimeString() : ''
       const info: Node = s.baselineNote
@@ -219,10 +233,16 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         rel: m.rel,
         agentCreated: m.agentCreated,
       }))
+      const gaps: Node[] = s.coverageGaps.map((gap) => ({
+        kind: 'info' as const,
+        label: 'Coverage gap: unverified shell command',
+        desc: gap.command ? gap.command.slice(0, 120) : gap.reason,
+        warn: true,
+      }))
       const histCount = this.controller.history().length
       const tail: Node[] = histCount > 0 ? [{ kind: 'history', count: histCount }] : []
       if (s.items.length === 0)
-        return [info, ...missing, ...fresh, { kind: 'info', label: 'No changes since baseline' }, ...tail]
+        return [info, ...gaps, ...missing, ...fresh, { kind: 'info', label: 'No changes since baseline' }, ...tail]
 
       const entries = s.items.map((item) => ({ item, wsPath: this.wsPathOf(item) }))
       if (!this.treeMode()) {
@@ -232,10 +252,10 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
             const d = path.dirname(e.wsPath)
             return { kind: 'file' as const, item: e.item, wsDir: d === '.' ? undefined : d }
           })
-        return [info, ...missing, ...fresh, ...files, ...tail]
+        return [info, ...gaps, ...missing, ...fresh, ...files, ...tail]
       }
       const index = buildDirIndex(entries)
-      return [info, ...missing, ...fresh, ...this.dirNodes('', index), ...tail]
+      return [info, ...gaps, ...missing, ...fresh, ...this.dirNodes('', index), ...tail]
     }
     if (node.kind === 'dir') return this.dirNodes(node.rel, node.index)
     if (node.kind === 'history') {
