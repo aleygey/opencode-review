@@ -45,7 +45,6 @@ export function writePluginConfig(workspaceRoot: string): string {
   const workspaces = current.workspaces && typeof current.workspaces === 'object' ? current.workspaces : {}
   workspaces[normalizedRealPath(workspaceRoot)] = {
     shellPolicy: cfg.get<string>('shellPolicy', 'audit'),
-    enforceReview: cfg.get<boolean>('enforceReview', true),
     maxBlobBytes: cfg.get<number>('maxBlobBytes', 20 * 1024 * 1024),
   }
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`

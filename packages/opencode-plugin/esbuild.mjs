@@ -20,7 +20,7 @@ await build({
   target: 'node20',
   format: 'esm',
   sourcemap: false,
-  banner: { js: '// OC Review companion plugin v0.12.0' },
+  banner: { js: '// OC Review companion plugin v0.12.1' },
   logLevel: 'info',
 })
 

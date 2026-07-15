@@ -2,7 +2,7 @@
   "name": "oc-review",
   "displayName": "OC Review — opencode change review",
   "description": "Review, navigate and roll back opencode's edits across nested git repos; inline diff marks and quick-ask about any selection.",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "publisher": "aleygey",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/aleygey/opencode-review" },
@@ -106,12 +106,7 @@
           "type": "string",
           "enum": ["strict", "audit", "off"],
           "default": "audit",
-          "description": "Companion handling for shell/custom tools whose writes cannot be proven: strict blocks them, audit records a visible coverage gap, off ignores them. Known shell mutators without declared outputs are always blocked."
-        },
-        "ocReview.enforceReview": {
-          "type": "boolean",
-          "default": true,
-          "description": "Block the next mutating OpenCode turn in the same session until the previous closed epoch has been reviewed and accepted in VS Code."
+          "description": "Companion handling for shell/custom tools whose writes cannot be proven: strict blocks them, audit records a visible coverage gap without interrupting OpenCode, and off ignores them."
         },
         "ocReview.maxBlobBytes": {
           "type": "integer",

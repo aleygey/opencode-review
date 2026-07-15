@@ -783,7 +783,6 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       }
       if (
         e.affectsConfiguration('ocReview.shellPolicy') ||
-        e.affectsConfiguration('ocReview.enforceReview') ||
         e.affectsConfiguration('ocReview.maxBlobBytes')
       ) {
         syncPluginConfig()
