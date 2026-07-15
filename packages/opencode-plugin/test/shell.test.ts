@@ -8,7 +8,7 @@ test('declared writes are parsed and stripped', () => {
   assert.equal(parsed?.command, 'cp x "a b.txt"')
 })
 
-test('mutating shell commands require declarations', () => {
+test('undeclared write commands are classified as mutations for policy handling', () => {
   assert.equal(classifyShell('sed -i s/a/b/ src/a.ts').kind, 'mutation')
   assert.equal(classifyShell('cp a b').kind, 'mutation')
   assert.equal(classifyShell('cat a > b').kind, 'mutation')

@@ -11,7 +11,7 @@ function git(cwd: string, args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
 
-test('captures exact file writes in the nearest nested repo and gates the next epoch', async () => {
+test('captures exact file writes in the nearest nested repo without gating subsequent tools', async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-review-plugin-'))
   const previousHome = process.env.OC_REVIEW_HOME
   process.env.OC_REVIEW_HOME = path.join(temp, 'data')
@@ -47,13 +47,25 @@ test('captures exact file writes in the nearest nested repo and gates the next e
     assert.notEqual(begin?.captures[0].snapshot.hash, end?.type === 'tool.end' ? end.captures[0].snapshot.hash : undefined)
     assert.equal(records.at(-1)?.type, 'epoch.closed')
 
-    await assert.rejects(
-      hooks['tool.execute.before'](
-        { tool: 'write', sessionID: 'ses-1', callID: 'call-2' },
-        { args: { filePath: file } },
-      ),
-      /still require VS Code review/,
+    await hooks['tool.execute.before'](
+      { tool: 'custom-search', sessionID: 'ses-1', callID: 'call-custom' },
+      { args: { query: 'value' } },
     )
+    await hooks['tool.execute.after']({ tool: 'custom-search', sessionID: 'ses-1', callID: 'call-custom' }, {})
+    await hooks['tool.execute.before'](
+      { tool: 'write', sessionID: 'ses-1', callID: 'call-2' },
+      { args: { filePath: file } },
+    )
+    fs.writeFileSync(file, 'export const value = 3\n')
+    await hooks['tool.execute.after']({ tool: 'write', sessionID: 'ses-1', callID: 'call-2' }, {})
+    await hooks.event({ event: { type: 'session.idle', properties: { sessionID: 'ses-1' } } })
+
+    const ungated = fs.readFileSync(path.join(store, 'journal.jsonl'), 'utf8')
+    assert.match(ungated, /"callID":"call-custom"/)
+    assert.match(ungated, /"type":"coverage.gap"/)
+    assert.match(ungated, /"callID":"call-2"/)
+    const pending = JSON.parse(fs.readFileSync(path.join(store, 'pending.json'), 'utf8')) as { epochs: unknown[] }
+    assert.equal(pending.epochs.length, 2)
 
     const epochID = (records.at(-1) as Extract<JournalRecord, { type: 'epoch.closed' }>).epochID
     const ack: ReviewAck = {
@@ -67,11 +79,47 @@ test('captures exact file writes in the nearest nested repo and gates the next e
       { tool: 'write', sessionID: 'ses-1', callID: 'call-3' },
       { args: { filePath: file } },
     )
+    fs.writeFileSync(file, 'export const value = 4\n')
+    await hooks['tool.execute.after']({ tool: 'write', sessionID: 'ses-1', callID: 'call-3' }, {})
+    await hooks.event({ event: { type: 'session.idle', properties: { sessionID: 'ses-1' } } })
     const compacted = fs.readFileSync(path.join(store, 'journal.jsonl'), 'utf8')
     assert.doesNotMatch(compacted, /call-1/)
+    assert.match(compacted, /call-2/)
     assert.match(compacted, /call-3/)
     const clearedAck = JSON.parse(fs.readFileSync(path.join(store, 'review-ack.json'), 'utf8')) as ReviewAck
     assert.deepEqual(clearedAck.acknowledgedEpochs, [])
+  } finally {
+    if (previousHome === undefined) delete process.env.OC_REVIEW_HOME
+    else process.env.OC_REVIEW_HOME = previousHome
+    fs.rmSync(temp, { recursive: true, force: true })
+  }
+})
+
+test('audit mode records an undeclared shell mutation without blocking it', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-review-shell-audit-'))
+  const previousHome = process.env.OC_REVIEW_HOME
+  process.env.OC_REVIEW_HOME = path.join(temp, 'data')
+  try {
+    const workspace = path.join(temp, 'workspace')
+    fs.mkdirSync(path.join(workspace, '.git'), { recursive: true })
+    const hooks: any = await OpencodeReviewPlugin({ directory: workspace, worktree: workspace })
+    await hooks['tool.execute.before'](
+      { tool: 'bash', sessionID: 'ses-shell', callID: 'call-shell' },
+      { args: { command: 'cp source.txt target.txt' } },
+    )
+    await hooks['tool.execute.after']({ tool: 'bash', sessionID: 'ses-shell', callID: 'call-shell' }, {})
+    await hooks.event({ event: { type: 'session.idle', properties: { sessionID: 'ses-shell' } } })
+
+    const store = instanceStore(workspace)
+    const records = fs
+      .readFileSync(path.join(store, 'journal.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as JournalRecord)
+    const gap = records.find((record) => record.type === 'coverage.gap')
+    assert.equal(gap?.type, 'coverage.gap')
+    assert.equal(gap?.callID, 'call-shell')
+    assert.match(gap?.reason ?? '', /no declared output paths/)
   } finally {
     if (previousHome === undefined) delete process.env.OC_REVIEW_HOME
     else process.env.OC_REVIEW_HOME = previousHome

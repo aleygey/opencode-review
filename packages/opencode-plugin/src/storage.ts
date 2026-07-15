@@ -19,7 +19,6 @@ import {
 
 export type PluginConfig = {
   shellPolicy: 'strict' | 'audit' | 'off'
-  enforceReview: boolean
   maxBlobBytes: number
 }
 
@@ -41,7 +40,6 @@ export type OpenMutationEpoch = {
 
 const DEFAULT_CONFIG: PluginConfig = {
   shellPolicy: 'audit',
-  enforceReview: true,
   maxBlobBytes: 20 * 1024 * 1024,
 }
 
@@ -110,7 +108,6 @@ export class CaptureStorage {
       const raw: any = local ?? workspace ?? global.defaults ?? global
       const value: PluginConfig = {
         shellPolicy: raw.shellPolicy === 'strict' || raw.shellPolicy === 'off' ? raw.shellPolicy : 'audit',
-        enforceReview: raw.enforceReview !== false,
         maxBlobBytes: Number.isFinite(raw.maxBlobBytes) && raw.maxBlobBytes > 0 ? raw.maxBlobBytes : DEFAULT_CONFIG.maxBlobBytes,
       }
       this.configCache = { at: now, value }

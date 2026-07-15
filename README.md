@@ -4,7 +4,7 @@
 
 OC Review 是一个 OpenCode companion plugin + VS Code 扩展，用来集中审查 OpenCode 实际写入磁盘的改动。
 
-v0.12 默认使用 **OpenCode-first capture**：不遍历工作区、不扫描全部 Git 仓库、不创建全量 checkpoint，也不注册 VS Code `**/*` watcher。OpenCode 插件只记录本轮工具实际触达的路径，VS Code 再按这些路径生成 Diff、标记、导航和回退。
+v0.12.1 默认使用 **OpenCode-first capture**：不遍历工作区、不扫描全部 Git 仓库、不创建全量 checkpoint，也不注册 VS Code `**/*` watcher。OpenCode 插件只记录本轮工具实际触达的路径，VS Code 再按这些路径生成 Diff、标记、导航和回退。
 
 这套设计面向以下场景：
 
@@ -29,9 +29,9 @@ OpenCode tool hook
   Diff / 行标记 / 快速跳转 / 回退 / Quick Ask / 审核确认
 ```
 
-OpenCode 一轮执行期间不会逐次阻塞。session 进入 idle 后，该轮 mutation epoch 才关闭；如果 `ocReview.enforceReview` 为 `true`，同一 session 的**下一次写操作**会等待上一轮在 VS Code 中全部审查并接受。只读工具仍可继续运行。
+OpenCode 一轮执行期间不会逐次阻塞。session 进入 idle 后，该轮 mutation epoch 才关闭并持续留在 VS Code 审查列表中，直到所有文件和 coverage gap 都被显式确认。未完成审查不会拒绝后续工具或文件修改；新改动会继续形成新的 epoch。
 
-这不依赖 `permission.edit=ask`，因此不会在每个文件修改处同步等待。
+这不依赖 `permission.edit=ask`，companion 也不会用 review 状态参与 OpenCode 工具放行判断。
 
 ## 功能
 
@@ -51,14 +51,14 @@ OpenCode 一轮执行期间不会逐次阻塞。session 进入 idle 后，该轮
 | 来源 | 默认处理 |
 | --- | --- |
 | `edit`、`write`、`patch`、`apply_patch`、`multiedit` | 工具运行前后精确捕获目标文件。 |
-| `cp`、`mv`、`rm`、`sed -i`、重定向、PowerShell 写命令等 | 没有声明输出路径时阻止，并要求重试。 |
+| `cp`、`mv`、`rm`、`sed -i`、重定向、PowerShell 写命令等 | 有写路径声明时精确捕获；默认 `audit` 下无声明则放行并记录 coverage gap。 |
 | `git merge/rebase/cherry-pick/revert/pull/am/commit/checkout/switch/reset/restore/stash` | 自动记录命令前后的 tracked dirty 路径和旧/新 HEAD；冲突时保存 Git stage 1/2/3。支持 `git -C` 和简单的 `cd ... && git ...`。 |
-| `git clean`、`git stash -u/--all`、`git checkout -f` | 可能删除无法从 post-state 推导的未跟踪文件，必须声明准确输出路径。 |
+| `git clean`、`git stash -u/--all`、`git checkout -f` | 可能删除无法从 post-state 推导的未跟踪文件；默认放行并记录 coverage gap，建议声明准确输出路径。 |
 | test/build/脚本解释器等可能产生文件的命令 | 不假定只读；`audit` 下生成 coverage gap，或用写路径标记声明输出。 |
 | 无法证明只读的 shell/custom tool | `audit`：记录 coverage gap；`strict`：阻止；`off`：放行。 |
 | OpenCode 之外的人工操作、IDE refactor、其他后台进程 | 故意不捕获。它们不属于 OpenCode 改动。 |
 
-对会写文件的 shell 命令，在命令第一行声明准确输出路径：
+为了获得完整 Diff 和可回退基线，建议对会写文件的 shell 命令在第一行声明准确输出路径：
 
 ```bash
 # oc-review-writes: ["services/api/src/a.ts", "services/api/src/b.ts"]
@@ -80,13 +80,13 @@ sed -i 's/old/new/g' services/api/src/a.ts services/api/src/b.ts
 
 ### 使用 VSIX
 
-1. 获取 `oc-review-0.12.0.vsix`。
+1. 获取 `oc-review-0.12.1.vsix`。
    - GitHub Actions 的 `build-and-test` workflow 会上传名为 `oc-review-vsix` 的 artifact。
    - 也可以按下方命令从源码本地打包。
 2. 在目标 VS Code 窗口执行 **Extensions: Install from VSIX...**，或运行：
 
    ```bash
-   code --install-extension oc-review-0.12.0.vsix --force
+   code --install-extension oc-review-0.12.1.vsix --force
    ```
 
 3. 打开代码工作区，运行：
@@ -129,7 +129,7 @@ npm run test:integration
 npm run package
 ```
 
-生成的 `packages/extension/oc-review-0.12.0.vsix` 已包含 companion plugin。
+生成的 `packages/extension/oc-review-0.12.1.vsix` 已包含 companion plugin。
 
 ## OpenCode 配置
 
@@ -162,17 +162,16 @@ SSE 是一个长期保持的 HTTP 事件流。OC Review 仅用它接收 session 
 4. 使用上下文菜单 **Toggle Reviewed** 标记确认过的文件。
 5. 对冲突文件分别查看 Base、Ours、Theirs；必要时用 Quick Ask 询问当前选区。
 6. 全部文件 Reviewed 后运行 **Accept Reviewed Epoch**。
-7. 如果存在 coverage gap，扩展会单独列出并要求显式确认；确认后该 session 的下一轮写操作才会放行。
+7. 如果存在 coverage gap，扩展会单独列出并要求显式确认；它不会阻断 OpenCode 的后续操作。
 
-OpenCode 在 `session.idle` 前异常退出时，companion 下次启动会恢复已有成功写入记录的 orphan epoch，不会让这批改动永久卡住。
+OpenCode 在 `session.idle` 前异常退出时，companion 下次启动会恢复已有成功写入记录的 orphan epoch，让这批改动仍可继续审查。
 
 ## 主要设置
 
 | 设置 | 默认值 | 说明 |
 | --- | --- | --- |
 | `ocReview.captureMode` | `plugin` | 默认无扫描捕获；`legacy-git` 启用旧 checkpoint 引擎。切换后需 Reload Window。 |
-| `ocReview.shellPolicy` | `audit` | 未知 shell/custom tool 的策略：`strict`、`audit`、`off`。 |
-| `ocReview.enforceReview` | `true` | 上一轮未接受时，阻止同一 session 的下一次 mutation。 |
+| `ocReview.shellPolicy` | `audit` | 未知 shell/custom tool 的策略：`audit` 记录 gap 并放行，`strict` 阻止，`off` 忽略。 |
 | `ocReview.maxBlobBytes` | `20971520` | 单文件 CAS 上限。超限文件仍显示，但无法保证字节级回退。 |
 | `ocReview.serverUrl` | 空 | OpenCode server 地址；为空时读取 lock 文件并探测端口。 |
 | `ocReview.serverPassword` | 空 | OpenCode server Basic Auth 密码。 |
@@ -221,7 +220,7 @@ OC Review: Diagnose
 ```text
 packages/
 ├── protocol/          # VS Code 与 companion 共用的 journal/CAS 协议
-├── opencode-plugin/   # OpenCode tool hooks、epoch barrier、冲突捕获
+├── opencode-plugin/   # OpenCode tool hooks、epoch journal、冲突捕获
 ├── extension/         # VS Code UI、Diff、导航、Quick Ask、VSIX 打包
 └── git-engine/        # legacy-git 兼容模式
 ```

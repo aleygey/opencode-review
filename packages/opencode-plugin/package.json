@@ -1,6 +1,6 @@
 {
   "name": "@oc-review/opencode-plugin",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "private": true,
   "type": "module",
   "main": "dist/opencode-review-plugin.js",

@@ -11,7 +11,7 @@ import {
 import { classifyShell } from './shell.ts'
 import { CaptureStorage, findRepoRoot, gitBlobsAtPaths, gitDirtyPaths, gitHead, gitTreeChangedPaths } from './storage.ts'
 
-const VERSION = '0.12.0'
+const VERSION = '0.12.1'
 const EMPTY_GIT_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 const FILE_TOOLS = new Set(['edit', 'write', 'patch', 'apply_patch', 'multiedit'])
 const READ_ONLY_TOOLS = new Set([
@@ -173,16 +173,6 @@ export const OpencodeReviewPlugin = async (ctx: any) => {
     return created
   }
 
-  const assertReviewed = (sessionID: string): void => {
-    if (!storage.config().enforceReview) return
-    const pending = storage.pruneAcknowledged().epochs.filter((item) => item.sessionID === sessionID && (item.changed || item.gaps > 0))
-    if (pending.length === 0) return
-    throw new Error(
-      `[oc-review] ${pending.length} previous mutation epoch(s) still require VS Code review. ` +
-        `Open OC Review, review every changed hunk, then run "Accept Reviewed Epoch".`,
-    )
-  }
-
   const begin = (input: any, output: any): void => {
     const tool = String(input.tool ?? '')
     const sessionID = String(input.sessionID ?? '')
@@ -224,10 +214,16 @@ export const OpencodeReviewPlugin = async (ctx: any) => {
         }
         else gap = 'git transition executed outside a discovered repository'
       } else if (classified.kind === 'mutation') {
-        throw new Error(
-          `[oc-review] Mutating shell command is not auditable without declared outputs. ` +
-            `Retry with a first line like: # oc-review-writes: ["relative/path"]`,
-        )
+        const policy = storage.config().shellPolicy
+        if (policy === 'strict') {
+          throw new Error(
+            `[oc-review] Mutating shell command is not auditable without declared outputs. ` +
+              `Retry with a first line like: # oc-review-writes: ["relative/path"] or set shellPolicy to audit/off.`,
+          )
+        }
+        if (policy === 'off') return
+        risk = 'unknown'
+        gap = classified.reason
       } else {
         const policy = storage.config().shellPolicy
         if (policy === 'strict') {
@@ -255,7 +251,6 @@ export const OpencodeReviewPlugin = async (ctx: any) => {
       gap = `tool "${tool}" has no declared write contract`
     }
 
-    assertReviewed(sessionID)
     const epoch = epochFor(sessionID)
     const before = paths.map((item) => storage.capture(item))
     gap ??= captureGap(before)
