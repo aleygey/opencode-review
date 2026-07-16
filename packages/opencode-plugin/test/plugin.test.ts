@@ -127,6 +127,67 @@ test('audit mode records an undeclared shell mutation without blocking it', asyn
   }
 })
 
+test('advertises and captures structured shell writes without forwarding review metadata', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-review-shell-writes-'))
+  const previousHome = process.env.OC_REVIEW_HOME
+  process.env.OC_REVIEW_HOME = path.join(temp, 'data')
+  try {
+    const workspace = path.join(temp, 'workspace')
+    const target = path.join(workspace, 'target.txt')
+    fs.mkdirSync(path.join(workspace, '.git'), { recursive: true })
+    fs.writeFileSync(target, 'before\n')
+    const hooks: any = await OpencodeReviewPlugin({ directory: workspace, worktree: workspace })
+
+    const definition: any = {
+      description: 'Run a shell command.',
+      parameters: {},
+      jsonSchema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+    }
+    await hooks['tool.definition']({ toolID: 'shell' }, definition)
+    assert.equal(definition.jsonSchema.properties.writes.type, 'array')
+    assert.deepEqual(definition.jsonSchema.required, ['command'])
+    assert.match(definition.description, /optional `writes` argument/)
+
+    const output: any = {
+      args: {
+        command: 'node mutate-target.js',
+        writes: [' target.txt ', 'target.txt'],
+      },
+    }
+    await hooks['tool.execute.before'](
+      { tool: 'shell', sessionID: 'ses-structured', callID: 'call-structured' },
+      output,
+    )
+    assert.deepEqual(output.args, { command: 'node mutate-target.js' })
+    fs.writeFileSync(target, 'after\n')
+    await hooks['tool.execute.after'](
+      { tool: 'shell', sessionID: 'ses-structured', callID: 'call-structured' },
+      {},
+    )
+    await hooks.event({ event: { type: 'session.idle', properties: { sessionID: 'ses-structured' } } })
+
+    const records = fs
+      .readFileSync(path.join(instanceStore(workspace), 'journal.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as JournalRecord)
+    const begin = records.find((record) => record.type === 'tool.begin')
+    const end = records.find((record) => record.type === 'tool.end')
+    assert.equal(begin?.type, 'tool.begin')
+    assert.deepEqual(begin?.captures.map((capture) => capture.relativePath), ['target.txt'])
+    assert.equal(end?.type === 'tool.end' ? end.changed : false, true)
+    assert.equal(records.some((record) => record.type === 'coverage.gap'), false)
+  } finally {
+    if (previousHome === undefined) delete process.env.OC_REVIEW_HOME
+    else process.env.OC_REVIEW_HOME = previousHome
+    fs.rmSync(temp, { recursive: true, force: true })
+  }
+})
+
 test('recovers a changed epoch when OpenCode restarts before session idle', async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-review-recovery-'))
   const previousHome = process.env.OC_REVIEW_HOME

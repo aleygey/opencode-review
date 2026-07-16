@@ -4,7 +4,7 @@
 
 OC Review 是一个 OpenCode companion plugin + VS Code 扩展，用来集中审查 OpenCode 实际写入磁盘的改动。
 
-v0.12.1 默认使用 **OpenCode-first capture**：不遍历工作区、不扫描全部 Git 仓库、不创建全量 checkpoint，也不注册 VS Code `**/*` watcher。OpenCode 插件只记录本轮工具实际触达的路径，VS Code 再按这些路径生成 Diff、标记、导航和回退。
+v0.12.2 默认使用 **OpenCode-first capture**：不遍历工作区、不扫描全部 Git 仓库、不创建全量 checkpoint，也不注册 VS Code `**/*` watcher。OpenCode 插件只记录本轮工具实际触达的路径，VS Code 再按这些路径生成 Diff、标记、导航和回退。
 
 这套设计面向以下场景：
 
@@ -18,7 +18,7 @@ v0.12.1 默认使用 **OpenCode-first capture**：不遍历工作区、不扫描
 ```text
 OpenCode tool hook
   ├─ edit/write/apply_patch: 精确捕获触达路径的 before/after
-  ├─ shell: 声明写路径，或产生 coverage gap
+  ├─ shell: 结构化声明写路径（旧版回退到注释标记），否则产生 coverage gap
   └─ Git transition: 捕获命令前后状态、HEAD 变化和冲突 stage
                   │
                   ▼
@@ -43,7 +43,7 @@ OpenCode 一轮执行期间不会逐次阻塞。session 进入 idle 后，该轮
 - 支持按 hunk、文件、仓库或整批回退，并支持撤销/重做回退。
 - Git 冲突保存 `base / ours / theirs`，冲突文件菜单可分别与当前结果比较。
 - `Ctrl+Alt+A` 可询问任意选区；Quick Ask fork 原 session 保留上下文，但禁用写文件、shell 和 task 工具。
-- 未知 shell/custom tool 在 `audit` 模式生成显眼的 coverage gap，接受前必须单独确认。
+- 未知 shell/custom tool 在 `audit` 模式生成 coverage gap；审查树默认折叠详情，接受前按批次确认。
 - 原 v0.11 Git checkpoint 引擎保留为显式 `legacy-git` 兼容模式。
 
 ## 捕获覆盖范围
@@ -51,21 +51,31 @@ OpenCode 一轮执行期间不会逐次阻塞。session 进入 idle 后，该轮
 | 来源 | 默认处理 |
 | --- | --- |
 | `edit`、`write`、`patch`、`apply_patch`、`multiedit` | 工具运行前后精确捕获目标文件。 |
-| `cp`、`mv`、`rm`、`sed -i`、重定向、PowerShell 写命令等 | 有写路径声明时精确捕获；默认 `audit` 下无声明则放行并记录 coverage gap。 |
+| `cp`、`mv`、`rm`、`sed -i`、重定向、PowerShell 写命令等 | Bash 工具有结构化 `writes` 时精确捕获；旧版标记兼容；无声明则放行并记录 coverage gap。 |
 | `git merge/rebase/cherry-pick/revert/pull/am/commit/checkout/switch/reset/restore/stash` | 自动记录命令前后的 tracked dirty 路径和旧/新 HEAD；冲突时保存 Git stage 1/2/3。支持 `git -C` 和简单的 `cd ... && git ...`。 |
 | `git clean`、`git stash -u/--all`、`git checkout -f` | 可能删除无法从 post-state 推导的未跟踪文件；默认放行并记录 coverage gap，建议声明准确输出路径。 |
 | test/build/脚本解释器等可能产生文件的命令 | 不假定只读；`audit` 下生成 coverage gap，或用写路径标记声明输出。 |
 | 无法证明只读的 shell/custom tool | `audit`：记录 coverage gap；`strict`：阻止；`off`：放行。 |
 | OpenCode 之外的人工操作、IDE refactor、其他后台进程 | 故意不捕获。它们不属于 OpenCode 改动。 |
 
-为了获得完整 Diff 和可回退基线，建议对会写文件的 shell 命令在第一行声明准确输出路径：
+companion 会在 OpenCode 发给模型的 Bash/Shell 工具定义中增加一个可选的 `writes: string[]`。模型声明完整写集合后，companion 只为这些路径建立修改前基线，并在调用内置工具前移除该辅助参数：
+
+```json
+{
+  "command": "sed -i 's/old/new/g' services/api/src/a.ts",
+  "description": "Update the API implementation",
+  "writes": ["services/api/src/a.ts"]
+}
+```
+
+`writes` 不是强制参数。缺失、为空或无效时不会阻止命令，仍按 `shellPolicy` 进入分类器或 coverage gap。对于没有向插件暴露 JSON Schema 的旧版 OpenCode，companion 自动回退到首行标记：
 
 ```bash
 # oc-review-writes: ["services/api/src/a.ts", "services/api/src/b.ts"]
 sed -i 's/old/new/g' services/api/src/a.ts services/api/src/b.ts
 ```
 
-该标记在执行前会被 companion 移除，不会改变实际命令。路径相对于 OpenCode 当前目录，也可以使用绝对路径。
+该标记同样会在执行前被 companion 移除。两种声明中的路径都相对于 OpenCode 当前目录，也可以使用绝对路径。
 
 ## 环境要求
 
@@ -80,13 +90,13 @@ sed -i 's/old/new/g' services/api/src/a.ts services/api/src/b.ts
 
 ### 使用 VSIX
 
-1. 获取 `oc-review-0.12.1.vsix`。
+1. 获取 `oc-review-0.12.2.vsix`。
    - GitHub Actions 的 `build-and-test` workflow 会上传名为 `oc-review-vsix` 的 artifact。
    - 也可以按下方命令从源码本地打包。
 2. 在目标 VS Code 窗口执行 **Extensions: Install from VSIX...**，或运行：
 
    ```bash
-   code --install-extension oc-review-0.12.1.vsix --force
+   code --install-extension oc-review-0.12.2.vsix --force
    ```
 
 3. 打开代码工作区，运行：
@@ -129,7 +139,7 @@ npm run test:integration
 npm run package
 ```
 
-生成的 `packages/extension/oc-review-0.12.1.vsix` 已包含 companion plugin。
+生成的 `packages/extension/oc-review-0.12.2.vsix` 已包含 companion plugin。
 
 ## OpenCode 配置
 

@@ -358,13 +358,9 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     }
     let allowedGaps: string[] = []
     if (state.coverageGaps.length) {
-      const details = state.coverageGaps
-        .slice(0, 5)
-        .map((gap) => `• ${gap.command?.slice(0, 100) ?? gap.reason}`)
-        .join('\n')
       const ack = await vscode.window.showWarningMessage(
-        `${state.coverageGaps.length} command/tool call(s) could not prove their write set:\n${details}` +
-          `${state.coverageGaps.length > 5 ? '\n…' : ''}\nAcknowledge incomplete coverage?`,
+        `${state.coverageGaps.length} command/tool call(s) have an unverified write set. ` +
+          'Acknowledge incomplete coverage?',
         { modal: true },
         'Acknowledge gaps',
       )
