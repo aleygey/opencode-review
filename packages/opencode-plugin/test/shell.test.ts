@@ -1,11 +1,38 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { classifyShell, extractDeclaredWrites } from '../src/shell.ts'
+import {
+  addStructuredWritesParameter,
+  classifyShell,
+  extractDeclaredWrites,
+  extractStructuredWrites,
+} from '../src/shell.ts'
 
 test('declared writes are parsed and stripped', () => {
   const parsed = extractDeclaredWrites('# oc-review-writes: ["a b.txt", "c"]\ncp x "a b.txt"')
   assert.deepEqual(parsed?.paths, ['a b.txt', 'c'])
   assert.equal(parsed?.command, 'cp x "a b.txt"')
+})
+
+test('structured writes are normalized and invalid declarations are ignored', () => {
+  assert.deepEqual(extractStructuredWrites([' a.txt ', 'b.txt', 'a.txt']), ['a.txt', 'b.txt'])
+  assert.equal(extractStructuredWrites([]), undefined)
+  assert.equal(extractStructuredWrites(['a.txt', 1]), undefined)
+  assert.equal(extractStructuredWrites(['\0bad']), undefined)
+})
+
+test('structured writes are added as an optional JSON Schema parameter', () => {
+  const output: any = {
+    jsonSchema: {
+      type: 'object',
+      properties: { command: { type: 'string' } },
+      required: ['command'],
+    },
+  }
+  assert.equal(addStructuredWritesParameter(output), 'added')
+  assert.equal(output.jsonSchema.properties.writes.type, 'array')
+  assert.deepEqual(output.jsonSchema.required, ['command'])
+  assert.equal(addStructuredWritesParameter(output), 'existing')
+  assert.equal(addStructuredWritesParameter({}), 'unsupported')
 })
 
 test('undeclared write commands are classified as mutations for policy handling', () => {

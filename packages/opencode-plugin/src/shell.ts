@@ -10,6 +10,46 @@ export type ShellClassification = {
 
 const MARKER = /^\s*#\s*oc-review-writes:\s*(\[[^\r\n]*\])\s*(?:\r?\n|$)/i
 
+const WRITES_SCHEMA = {
+  type: 'array',
+  items: { type: 'string', minLength: 1 },
+  uniqueItems: true,
+  description:
+    'Exact file paths this command may create, modify, move, or delete. Use workspace-relative or absolute paths. ' +
+    'Omit this field when the complete write set is unknown.',
+} as const
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+export type StructuredWritesParameterResult = 'added' | 'existing' | 'unsupported'
+
+export function addStructuredWritesParameter(output: any): StructuredWritesParameterResult {
+  const schema = output?.jsonSchema
+  if (!isRecord(schema) || (schema.type !== undefined && schema.type !== 'object')) return 'unsupported'
+  const properties = isRecord(schema.properties) ? schema.properties : {}
+  if (Object.prototype.hasOwnProperty.call(properties, 'writes')) return 'existing'
+  output.jsonSchema = {
+    ...schema,
+    type: schema.type ?? 'object',
+    properties: { ...properties, writes: WRITES_SCHEMA },
+  }
+  return 'added'
+}
+
+export function extractStructuredWrites(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined
+  const paths: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') return undefined
+    const candidate = item.trim()
+    if (!candidate || candidate.includes('\0')) return undefined
+    paths.push(candidate)
+  }
+  return [...new Set(paths)]
+}
+
 export function extractDeclaredWrites(command: string): { command: string; paths: string[] } | undefined {
   const match = command.match(MARKER)
   if (!match) return undefined

@@ -8,10 +8,10 @@ import {
   type ToolBeginRecord,
   type ToolEndRecord,
 } from '../../protocol/src/index.ts'
-import { classifyShell } from './shell.ts'
+import { addStructuredWritesParameter, classifyShell, extractStructuredWrites } from './shell.ts'
 import { CaptureStorage, findRepoRoot, gitBlobsAtPaths, gitDirtyPaths, gitHead, gitTreeChangedPaths } from './storage.ts'
 
-const VERSION = '0.12.1'
+const VERSION = '0.12.2'
 const EMPTY_GIT_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 const FILE_TOOLS = new Set(['edit', 'write', 'patch', 'apply_patch', 'multiedit'])
 const READ_ONLY_TOOLS = new Set([
@@ -91,6 +91,7 @@ export const OpencodeReviewPlugin = async (ctx: any) => {
   const storage = new CaptureStorage(directory, worktree, VERSION)
   const calls = new Map<string, CallState>()
   const epochs = new Map<string, EpochState>()
+  const structuredWritesTools = new Map<string, 'injected' | 'native'>()
 
   const recordBase = () => ({
     v: PROTOCOL_VERSION,
@@ -190,13 +191,19 @@ export const OpencodeReviewPlugin = async (ctx: any) => {
         gap = `${tool} did not expose a recognizable file path`
       }
     } else if (tool === 'bash' || tool === 'shell') {
-      command = String(output.args?.command ?? '')
+      const writesMode = structuredWritesTools.get(tool)
+      const structuredWrites = writesMode ? extractStructuredWrites(output.args?.writes) : undefined
+      if (writesMode === 'injected' && output.args && typeof output.args === 'object') delete output.args.writes
+      const originalCommand = String(output.args?.command ?? '')
+      command = originalCommand
       const classified = classifyShell(command)
       command = classified.command
-      if (classified.kind === 'read-only') return
-      if (classified.kind === 'declared') {
+      if (command !== originalCommand) output.args.command = command
+      if (structuredWrites) {
+        paths = structuredWrites
+      } else if (classified.kind === 'read-only') return
+      else if (classified.kind === 'declared') {
         paths = classified.paths
-        output.args.command = classified.command
       } else if (classified.kind === 'git-transition') {
         risk = 'git'
         const commandDirectory = (classified.gitDirectories ?? []).reduce(
@@ -438,9 +445,14 @@ export const OpencodeReviewPlugin = async (ctx: any) => {
   return {
     'tool.definition': async (input: any, output: any) => {
       if (input.toolID !== 'bash' && input.toolID !== 'shell') return
-      output.description +=
-        '\n\nOC Review: when this command can modify files, put a first line ' +
-        '`# oc-review-writes: ["path/one", "path/two"]`. Git merge/rebase/cherry-pick/revert/pull are tracked automatically.'
+      const structured = addStructuredWritesParameter(output)
+      if (structured === 'unsupported') structuredWritesTools.delete(input.toolID)
+      else structuredWritesTools.set(input.toolID, structured === 'added' ? 'injected' : 'native')
+      output.description += structured !== 'unsupported'
+        ? '\n\nOC Review: when this command may modify files and its complete write set is known, set the optional `writes` argument ' +
+          'to the exact paths. Omit it when unknown. Git merge/rebase/cherry-pick/revert/pull are tracked automatically.'
+        : '\n\nOC Review: when this command can modify files, put a first line ' +
+          '`# oc-review-writes: ["path/one", "path/two"]`. Git merge/rebase/cherry-pick/revert/pull are tracked automatically.'
     },
     'tool.execute.before': async (input: any, output: any) => begin(input, output),
     'tool.execute.after': async (input: any) => end(input),

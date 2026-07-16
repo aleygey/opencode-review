@@ -10,6 +10,8 @@ export type DirIndex = Map<string, { dirs: string[]; files: { item: ReviewItem; 
 
 export type Node =
   | { kind: 'info'; label: string; desc?: string; warn?: boolean; command?: vscode.Command }
+  | { kind: 'coverageGaps'; gaps: ReviewState['coverageGaps'] }
+  | { kind: 'coverageGap'; gap: ReviewState['coverageGaps'][number] }
   | { kind: 'newRepo'; repoRoot: string; rel: string; agentCreated: boolean }
   | { kind: 'dir'; rel: string; repoRoot?: string; index: DirIndex } // repoRoot set when this dir IS a nested repo root
   | { kind: 'file'; item: ReviewItem; wsDir?: string }
@@ -131,6 +133,26 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         if (node.warn) t.tooltip = node.desc
         return t
       }
+      case 'coverageGaps': {
+        const t = new vscode.TreeItem('Coverage gaps', vscode.TreeItemCollapsibleState.Collapsed)
+        t.description = `${node.gaps.length} unverified call(s)`
+        t.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'))
+        t.contextValue = 'coverageGaps'
+        t.id = 'coverage-gaps'
+        t.tooltip = `${node.gaps.length} command/tool call(s) have an unverified write set.`
+        return t
+      }
+      case 'coverageGap': {
+        const firstLine = node.gap.command?.trim().split(/\r?\n/, 1)[0]
+        const label = firstLine ? firstLine.slice(0, 160) : node.gap.reason
+        const t = new vscode.TreeItem(label)
+        t.description = firstLine ? node.gap.reason : undefined
+        t.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'))
+        t.contextValue = 'coverageGap'
+        t.id = `coverage-gap:${node.gap.instanceRoot}:${node.gap.epochID}:${node.gap.callID}`
+        t.tooltip = node.gap.command ? `${node.gap.reason}\n\n${node.gap.command}` : node.gap.reason
+        return t
+      }
       case 'newRepo': {
         const t = new vscode.TreeItem(`⚠ 新仓库未纳入基线: ${node.rel}`)
         t.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'))
@@ -233,12 +255,9 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
         rel: m.rel,
         agentCreated: m.agentCreated,
       }))
-      const gaps: Node[] = s.coverageGaps.map((gap) => ({
-        kind: 'info' as const,
-        label: 'Coverage gap: unverified shell command',
-        desc: gap.command ? gap.command.slice(0, 120) : gap.reason,
-        warn: true,
-      }))
+      const gaps: Node[] = s.coverageGaps.length
+        ? [{ kind: 'coverageGaps', gaps: s.coverageGaps }]
+        : []
       const histCount = this.controller.history().length
       const tail: Node[] = histCount > 0 ? [{ kind: 'history', count: histCount }] : []
       if (s.items.length === 0)
@@ -256,6 +275,9 @@ export class ChangesTree implements vscode.TreeDataProvider<Node> {
       }
       const index = buildDirIndex(entries)
       return [info, ...gaps, ...missing, ...fresh, ...this.dirNodes('', index), ...tail]
+    }
+    if (node.kind === 'coverageGaps') {
+      return node.gaps.map((gap) => ({ kind: 'coverageGap', gap }))
     }
     if (node.kind === 'dir') return this.dirNodes(node.rel, node.index)
     if (node.kind === 'history') {
